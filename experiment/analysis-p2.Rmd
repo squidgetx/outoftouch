@@ -1,0 +1,227 @@
+---
+title: "Pilot 2 Analysis"
+output: pdf_document
+---
+
+```{r echo=F}
+pacman::p_load(tidyverse, here, stringr, psych)
+pacman::p_load(fixest, ggcorrplot, estimatr, marginaleffects, patchwork, modelsummary, knitr)
+  personality_levels <- c('Disagree strongly', 'Disagree moderately', 'Neither agree nor disagree', 'Agree moderately', 'Agree strongly')
+
+  econ_levels <- c('Much Worse', 'Somewhat Worse', 'About the Same', 'Somewhat Better', 'Much Better')
+  pop_levels <- c('Strongly Disagree', 'Somewhat Disagree', 'Neither', 'Somewhat Agree', 'Strongly Agree')
+  article_levels <- c("Don't trust at all", 'Trust very little', 'Trust a little', 'Trust a moderate amount', 'Trust a great deal')
+  conpress_levels <- c("Hardly any", 'Only some', 'A great deal')
+
+df <- read_csv(here('experiment/data/populism and news3.csv')) %>% mutate(duration = `Duration (in seconds)`, 
+                                                                      att = case_when(
+                                                                        Q_att1 != 'Somewhat disagree' ~ 'Failed attention check',
+                                                                        duration < 240 ~ 'Speeder',
+                                                                        TRUE ~ 'N/A'
+                                                                      ),
+                                                                      
+    article_trust = ordered(Q_article_trust, levels=article_levels) %>% as.numeric,
+    econ_pre = ordered(Q_econ_pre, levels=econ_levels) %>% as.numeric,
+    econ_post = ordered(Q_econ_post, levels=econ_levels) %>% as.numeric,
+        comment_neg_tone = group %in% c(1,3),
+    article_pos_tone = group %in% c(1,2),
+        will_of_ppl = ordered(Q_pop1, levels=pop_levels) %>% as.numeric(),
+    # pop2: Politicians and elites use their power to try to improve people's lives (reverse coded)
+    power_improve_rev = ordered(Q_pop2, levels=rev(pop_levels)) %>% as.numeric(),
+    # pop3: The system is stacked against people like me
+    system_stacked = ordered(Q_pop3, levels=pop_levels) %>% as.numeric(),
+    # pop4: I'd rather put my trust in the opinions of experts than the wisdom of ordinary people (reverse coded)
+    trust_experts_rev = ordered(Q_pop4, levels=rev(pop_levels)) %>% as.numeric(),
+    # pop5: Politics is a fight between the good people and the corrupt elite
+    good_corrupt = ordered(Q_pop5, levels=pop_levels) %>% as.numeric(),
+    leader_represent = ordered(Q_pop6, levels=pop_levels) %>% as.numeric(),
+    ordinary_represent_rev = ordered(Q_pop7, levels=rev(pop_levels)) %>% as.numeric(),
+    ordinary_policies_rev = ordered(Q_pop8, levels=rev(pop_levels)) %>% as.numeric(),
+    rely_experts_too_much = ordered(Q_pop9, levels=pop_levels) %>% as.numeric(),
+    experts_claim = ordered(Q_pop10, levels=pop_levels) %>% as.numeric(),
+    unfair_system = ordered(Q_pop11, levels=pop_levels) %>% as.numeric(),
+    pop1pre = ordered(Q_pop1_pre_1, levels=pop_levels) %>% as.numeric(),
+    pop2pre = ordered(Q_pop1_pre_2, levels=pop_levels) %>% as.numeric(),
+    pop3pre = ordered(Q_pop1_pre_3, levels=pop_levels) %>% as.numeric(),
+    pop4pre = ordered(Q_pop1_pre_4, levels=rev(pop_levels)) %>% as.numeric(),
+    news_trust_rev = ordered(Q_news_trust, levels=rev(c('Not at all', 'Not too much', 'Some', 'A fair amount', 'A lot'))) %>% as.numeric,
+    conpress_rev = case_when(
+      Q_conpress == 'Hardly any' ~ 5,
+      Q_conpress == 'Only some' ~ 3,
+      Q_conpress == 'A great deal' ~ 1,
+    ),
+newsint = ordered(Q_newsint, levels=c('Hardly at all', 'Only now and then', 'Some of the time', 'Most of the time')) %>% as.numeric,
+    pers1 = ordered(Q_personality_1, levels=personality_levels) %>% as.numeric,
+    pers2 = ordered(Q_personality_2, levels=personality_levels) %>% as.numeric,
+    pers3 = ordered(Q_personality_3, levels=personality_levels) %>% as.numeric,
+    pers4 = ordered(Q_personality_4, levels=personality_levels) %>% as.numeric,
+    faminc_num = str_extract(Q_faminc, "\\d[\\d,]*") %>% str_remove(',') %>% as.numeric(),
+    faminc_num_log = log(faminc_num),
+    
+                                                                      ) %>% filter(!is.na(Q_manip_agree))
+
+df$fac2_z <- scale(df$experts_claim) + scale(df$trust_experts_rev) + scale(df$rely_experts_too_much)
+#will_of_ppl, good_corrupt, leader_represent, unfair_system
+df$fac1_z <- scale(df$will_of_ppl) + scale(df$good_corrupt) + scale(df$leader_represent) + scale(df$unfair_system)
+df$news_trust_idx <- -df$news_trust_rev - df$conpress_rev
+df$manip_agree <- as.numeric(ordered(df$Q_manip_agree, levels=c("Strongly disagreed", "Somewhat disagreed", "Neither", "Somewhat agreed", "Strongly agreed")))
+
+```
+
+```{r}
+df$fac1 <- df$will_of_ppl + df$good_corrupt + df$leader_represent + df$unfair_system
+df$fac1b <- df$fac1 + df$ordinary_represent_rev + df$power_improve_rev 
+df$fac2 <- df$experts_claim + df$trust_experts_rev + df$rely_experts_too_much
+df.att <- df %>% filter(att == 'N/A')
+```
+
+```{r}
+df %>% select(fac1, fac2, pop1pre, pop2pre, pop3pre, pop4pre) %>% cor 
+etable(
+  feols(fac1 ~ pop1pre, data=df),
+  feols(fac1 ~ pop1pre + pop2pre, data=df),
+  feols(fac1 ~ pop1pre + pop2pre + pop3pre, data=df),
+  feols(fac1 ~ pop1pre + pop2pre + pop3pre + pop4pre, data=df),
+  digits=2
+)
+etable(
+  feols(fac2 ~ pop1pre, data=df),
+  feols(fac2 ~ pop1pre + pop2pre, data=df),
+  feols(fac2 ~ pop1pre + pop2pre + pop3pre, data=df),
+  feols(fac2 ~ pop1pre + pop2pre + pop3pre + pop4pre, data=df),
+  digits=2
+)
+etable(
+  feols(system_stacked ~ pop1pre, data=df),
+  feols(system_stacked ~ pop1pre + pop2pre, data=df),
+  feols(system_stacked ~ pop1pre + pop2pre + pop3pre, data=df),
+  feols(system_stacked ~ pop1pre + pop2pre + pop3pre + pop4pre, data=df),
+  digits=2
+)
+```
+
+# Results
+
+## Article/Comment Agreement Manipulation Check
+
+```{r}
+
+etable(
+  feols(manip_agree ~ comment_neg_tone * article_pos_tone, data=df.att),
+  feols(manip_agree ~ factor(group), data=df.att),
+  digits=2
+)
+```
+The manipulation check points in the right direction. 
+
+1. Respondents with the positive article / negative comments (mismatch) said the article/comments disagreed
+2. Respondents with the positive article / neutral comments said the article/comments neither agreed/disagreed
+3. Respondents with the negative article / negative comments (mismatch) said the article/comments agreed.
+4. Respondents with the negative article / neutral comments (mismatch) said neither, and the difference between this condition and condition 2 was not stat sig 
+
+The R2 is pretty high I think which is great. There's a little bit of variance/noise but overall seems like it works.
+The only nitpick I would have is regarding the symmetry. It looks like (relative to the neutral comment condition) the perceived mismatch is greater than the perceived match.
+This could be because the negative news article is a bit muted in tone
+
+
+## Econ Perceptions and News Trust 
+
+```{r}
+
+etable(
+  feols(econ_post ~ comment_neg_tone * article_pos_tone + PG + econ_pre + newsint, data=df.att),
+  feols(Q_second_order_1 ~ comment_neg_tone * article_pos_tone + PG + econ_pre + newsint, data=df.att),
+  feols(article_trust ~ comment_neg_tone * article_pos_tone + PG + econ_pre + newsint, data=df.att),
+  feols(news_trust_idx ~ comment_neg_tone * article_pos_tone + PG + econ_pre + newsint, data=df.att),
+  digits=2
+)
+```
+
+Negative comments (under negative article) decrease economic perceptions (great!)
+However, positive article (under neutral comments) did *not* increase economic perceptions which is different from pilot 1.
+Further, the interaction is positive and noisy, suggesting that negative comments (under positive article) compared to neutral does not shift perceptions much, either. 
+
+Looking at second order perceptions (how many americans do you think struggle to pay the bills), we get noisy but promising results. The positive article actually moves people down on this 8pp with a reasonable SE. Negative comments don't seem to move anything which is reasonable if the article is already negative. Critically, the positive interaction with reasonable SE suggests that the mismatch condition basically eliminates respondents' positive response to the positive article which is right in line with the theory. 
+
+Looking at article trust, there's a clear massive, negative effect of positive article suggesting that 
+people do not trust the positive article in the neutral comments condition. There is also a nice negative interaction effect suggesting that the negative comments further decrease trust in the positive article. 
+
+Bizarrely, mainstream media trust results are not aligned with article level trust results. 
+We get the expected negative effect of the negative interaction. 
+It is actually a little weird for there to be a main effect of negative comments because the context is negative article
+However, there's a *positive* effect of the positive article on mainstream trust.
+
+1. These results are fairly encouraging, especially the second order and interactions on trust
+2. The positive article....might be weird? It doesn't improve econ perceptions but it does make people think fewer % of people are willing to pay the bills (Could be noise). We saw in pilot 1 that it did improve econ perceptions, but it could be that the longer survey in pilot 2 made this more difficult. We see that it is overall not trusted, but that it *increases* trust in mainstream outlets. Is it possible it's so unrealistic that it reminds them that mainstream news is not like this? I think in order for the theory to work the audience needs to feel like this is a real article that a real national outlet is running in order for it to "connect" to the system.
+3. Alternatively, we could say its' just noise. I mean for N=110 we basically have 12 different coefficients that we are looking at. We observe that 8 of them are pointing the right way sign wise, 2 of them are pointing the wrong way sign wise with p < 0.5 and 2 are pointing the wrong way sign wise with p > 0.5.
+
+## Populism Results
+```{r}
+
+etable(
+  feols(fac1 ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre + newsint + faminc_num_log + pers1 + pers2 + pers3 + pers4, data=df.att),
+  feols(fac1_z ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre + newsint + faminc_num_log + pers1 + pers2 + pers3 + pers4, data=df.att),
+  feols(fac2 ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre+ newsint + faminc_num_log + pers1 + pers2 + pers3 + pers4, data=df.att),
+  digits=2
+)
+```
+
+- Negative comments increase people centrism (factor 1) but not anti elitism (factor 2) under neutral article (Great)
+- Positive article increases people centrism under neutral comments, but very noisy (and no effect for anti elitism) (OK)
+- Interaction for people centrism is negative and significant (Bad)
+- Interaction for anti elitism is positive and super noisy (Meh)
+
+Ok. So the biggest concern is that we have a LARGE NEGATIVE interaction effect for people centrism. Which doesnt make any sense and is contrary to the theory. Why is this?
+
+```{r}
+etable(
+  feols(will_of_ppl ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att),
+  feols(good_corrupt ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att),
+  feols(unfair_system ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att), 
+  feols(leader_represent ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att), 
+  feols(ordinary_represent_rev ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att), 
+  feols(power_improve_rev ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att), 
+  keep=c('tone', 'PG'),
+  digits=2
+)
+```
+
+The index seems well constructed. The negative interaction is somewhat consistent across all the questions. 
+It seems like unfair_system and leader_represent are driving most of the effect with positive main effects for both
+negative comments and positive article, then a negative interaction. Is it possible we're hitting a ceiling effect of some kind?
+Note that will of the people is the only one responding the way we expected although its super noisy AND its very partisan unlike the rest of the index...
+
+```{r}
+df %>% group_by(group) %>% summarize(
+  mean(leader_represent),
+  sd(leader_represent),
+  mean(unfair_system),
+  sd(unfair_system),
+) %>% kable
+```
+
+```{r}
+etable(
+  feols(trust_experts_rev ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att),
+  feols(experts_claim ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att),
+  feols(rely_experts_too_much ~ comment_neg_tone * article_pos_tone + PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre, data=df.att), 
+  digits=2
+)
+```
+Looking at the subcomponents, the experts_claim has the biggest interaction effect (expected) but there's a lot of noise
+
+# Checking R2 
+
+```{r}
+etable(
+  feols(fac1 ~ PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre + newsint + faminc_num_log , data=df.att),
+  feols(fac2 ~ PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre+ newsint + faminc_num_log , data=df.att),
+   feols(fac1 ~ PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre + newsint + faminc_num_log + pers1 + pers2 , data=df.att),
+  feols(fac2 ~ PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre+ newsint + faminc_num_log + pers1 + pers2 , data=df.att),
+  feols(fac1 ~ PG + econ_pre + pop1pre + pop2pre + pop3pre + pop4pre + newsint + faminc_num_log + pers1 + pers2 + pers3 + pers4, data=df.att),
+  feols(fac2 ~ PG + econ_pre + pop1pre + pop1pre + pop2pre + pop3pre + pop4pre+ newsint + faminc_num_log + pers1 + pers2 + pers3 + pers4, data=df.att),
+  digits=2
+)
+```
+
+One good news is that we have a lot of power now. R2 around 0.5 is great.

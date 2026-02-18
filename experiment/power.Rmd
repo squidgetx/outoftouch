@@ -1,0 +1,176 @@
+---
+title: "power"
+output: html_document
+---
+```{r}
+pacman::p_load(tidyverse, fixest, furrr, here)
+
+alpha <- 0.05 # Standard significance level
+sims <- 400 # Number of simulations to conduct for each N
+tau2 <- 0
+c <- 0.7
+
+
+test_sim <- function(N, c, tau=0.2) { 
+  X <- MASS::mvrnorm(n=N, mu=c(0, 0), Sigma=matrix(c(1, c, c, 1), 2))
+  err <- rnorm(n = N, mean = 0, sd = 1)
+  Y0 <- X[, 2]
+  Y0 <- Y0 / sd(Y0)
+  # Y1 is positive article, negative comments.
+  Y1 <- Y0 + tau
+  # Y2 is positive article, neutral comments
+  Y2 <- Y0
+  # Y3 is negative article, negative comments
+  Y3 <- Y0 + tau2
+  # Y4 is negative article, neutral comments
+  Y4 <- Y0 
+  results <- map_dfr(1:sims, \(i) {
+    negative.comments <- rbinom(N, 1, 0.5)
+    negative.article <- rbinom(N, 1, 0.5)
+
+    d <- data.frame(X = X[, 1], nc = negative.comments, na = negative.article) %>% mutate(
+      Y0 = Y0,
+      Y = case_when(
+        nc == 1 & na==0 ~ Y1,
+        nc == 0 & na ==0 ~ Y2,
+        nc == 1 & na==1 ~ Y3,
+        nc == 0 & na==1 ~ Y4,
+      )
+    )
+    fit.sim <- lm(Y ~ nc * na + X, data = d) 
+    list(
+      'h1.sig' = coef(summary(fit.sim))["nc", "Pr(>|t|)"] <= alpha,
+      'h2.sig' = coef(summary(fit.sim))["nc:na", "Pr(>|t|)"] <= alpha,
+      'h1.est' = coef(summary(fit.sim))["nc", "Estimate"],
+      'h2.est' = coef(summary(fit.sim))["nc:na", "Estimate"],
+      'r2' = (feols(Y0 ~ X, data = d) %>% fitstat(type='r2'))$r2
+    )
+  })
+  list(
+    h1.power = mean(results$h1.sig),
+    h2.power = mean(results$h2.sig),
+    h1.est = mean(results$h1.est),
+    h2.est = mean(results$h2.est),
+    N= N,
+    c.raw=c,
+    r2.emp = mean(results$r2),
+    tau=tau
+  )
+}
+
+plan(multisession, workers = 4)
+df <- future_map_dfr(seq(400,2200,100), \(Na) {
+  map_dfr(
+    c(0.6, 0.7, 0.8), \(ca) {
+      test_sim(N=Na, c=ca)
+    }
+  )
+}, .options = furrr_options(seed = 123))
+df <- future_map_dfr(c(0.2,0.3,0.4, 0.5), \(Na) {
+    test_sim(N=300, c=0.45, tau=Na)
+}, .options = furrr_options(seed = 123))
+df$r2.emp %>% mean
+df %>% ggplot(aes(x=tau, y=h1.power)) + geom_point()
+
+
+df_main <- df %>%
+  group_by(c.raw) %>%
+  mutate(r2 = factor(round(mean(r2.emp), digits=1))) %>%
+  ungroup() %>%
+  pivot_longer(c(h1.power, h2.power)) %>%
+  mutate(
+    name = recode(name,
+      "h1.power" = "Comment Main Effect",
+      "h2.power" = "Mismatch Interaction"
+    ),
+    effect_size = factor(tau)
+  ) %>%
+  select(N, name, value, r2, effect_size)
+```
+
+## Power for Triple Interaction (H4): Mismatch × Econ_Pre
+
+```{r triple-interaction-power}
+# Simulate power for the triple interaction: article_positive × comment_negative × econ_pre
+# tau_het = effect size of the triple interaction (how much the mismatch effect changes per SD of econ_pre)
+# tau_main = average mismatch interaction effect (can be 0 if we only care about het effect)
+
+test_sim_het <- function(N, c, tau_het = 0.2, tau_main = 0.2) {
+  # X[,1] is a pre-treatment covariate correlated with outcome (e.g., pre-treatment populism)
+  # X[,2] is the baseline outcome
+  X <- MASS::mvrnorm(n = N, mu = c(0, 0), Sigma = matrix(c(1, c, c, 1), 2))
+
+  # econ_pre: continuous moderator (standardized, ~N(0,1))
+  econ_pre <- rnorm(N)
+
+  Y0 <- X[, 2]
+  Y0 <- Y0 / sd(Y0)
+
+  results <- map_dfr(1:sims, \(i) {
+    nc <- rbinom(N, 1, 0.5)  # comment_negative
+    ap <- rbinom(N, 1, 0.5)  # article_positive
+
+    # DGP: Y = Y0 + tau_main * (ap * nc) + tau_het * (ap * nc * econ_pre) + noise
+    # The mismatch effect = tau_main + tau_het * econ_pre
+    # For optimists (high econ_pre), mismatch effect is larger
+    # For pessimists (low econ_pre), mismatch effect is smaller (or opposite)
+    err <- rnorm(N, 0, 1)
+    Y <- Y0 + tau_main * (ap * nc) + tau_het * (ap * nc * econ_pre) + err
+
+    d <- data.frame(Y = Y, Y0=Y0,X = X[, 1], nc = nc, ap = ap, econ_pre = econ_pre)
+
+    fit <- lm(Y ~ ap * nc * econ_pre + X, data = d)
+    cs <- coef(summary(fit))
+
+    list(
+      'mismatch.sig' = cs["ap:nc", "Pr(>|t|)"] <= alpha,
+      'mismatch.est' = cs["ap:nc", "Estimate"],
+      'triple.sig' = cs["ap:nc:econ_pre", "Pr(>|t|)"] <= alpha,
+      'triple.est' = cs["ap:nc:econ_pre", "Estimate"],
+      'r2' = (feols(Y0 ~ X, data = d) %>% fitstat(type='r2'))$r2
+    )
+  })
+  list(
+    mismatch.power = mean(results$mismatch.sig),
+    triple.power = mean(results$triple.sig),
+    mismatch.est = mean(results$mismatch.est),
+    triple.est = mean(results$triple.est),
+    N = N,
+    tau_het = tau_het,
+    r2 = mean(results$r2)
+  )
+}
+
+plan(multisession, workers = 4)
+df_het <- future_map_dfr(seq(500, 2500, 100), \(Na) {
+  map_dfr(
+    c(0.20, 0.3, 0.4), \(th) {
+      test_sim_het(N = Na, c = 0.7, tau_het = th, tau_main = 0.2)
+    }
+  )
+}, .options = furrr_options(seed = 457))
+
+df_triple <- df_het %>%
+  mutate(
+    name = "Triple Interaction",
+    value = triple.power,
+    r2 = factor(round(r2, 1)),
+    effect_size = factor(tau_het)
+  ) %>%
+  select(N, name, value, r2, effect_size)
+
+bind_rows(df_main, df_triple) %>%
+  mutate(name = factor(name, levels = c(
+    "Comment Main Effect",
+    "Mismatch Interaction",
+    "Triple Interaction"
+  ))) %>%
+  ggplot(aes(x = N, y = value, color = effect_size, lty = r2)) +
+  geom_point(size = 0.8) +
+  geom_smooth(se = FALSE) +
+  facet_wrap(~name) +
+  geom_hline(yintercept = 0.8, lty = 3, alpha = 0.5) +
+  labs(y = "Power", color = "Effect size", lty = expression(R^2)) +
+  theme_bw()
+ggsave(here('figures/power3.png'), width = 12, height = 4)
+```

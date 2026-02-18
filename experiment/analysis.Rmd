@@ -1,0 +1,308 @@
+---
+title: 'Pilot Analysis'
+---
+
+```{r}
+pacman::p_load(tidyverse, here, stringr, psych)
+pacman::p_load(fixest, ggcorrplot, estimatr, marginaleffects, patchwork, modelsummary)
+imgdir <- function(img) {
+  paste0('~/workspace/populism_comments/figures/', img, '.png')
+}
+options(
+  modelsummary_fmt = fmt_decimal(digits=2),
+  modelsummary_stars = TRUE,
+  modelsummary_gof_map = c('nobs', 'r.squared')
+)
+# Load data using shared loading script
+source(here('experiment/load.R'))
+df <- load_experiment_data()
+plot_model_slope <- function(m, title=NULL, var='comment_neg_tone', byvars=c('article_pos_tone'), xlab='Positive Article') {
+  if (is.null(title)) {
+    title = insight::find_response(m)
+  }
+  if (var == 'comment_neg_tone') {
+    ylab = 'Negative Comment Marginal Effect'
+  } else {
+    ylab = 'Positive Article Marginal Effect'
+  }
+  plot_slopes(
+    m,
+    variable=var,
+    by=byvars,
+  ) + labs(title=title, x=xlab, y=ylab) + geom_hline(yintercept=0, lty=3) + theme_bw()
+}
+
+CTL_FMLA = "+ faminc_num_log + econ_pre + newsint + pers3 + Q_pid3"
+
+get_models <- function(df, yvars, ctl_fmla = CTL_FMLA) {
+  models <- lapply(yvars, \(yv) {
+    lm(as.formula(paste(yv, "~ comment_neg_tone * article_pos_tone", ctl_fmla)), data=df)
+  })
+  names(models) = yvars
+  models
+}
+
+get_het_models <- function(df, yvars, het_var, ctl_fmla = CTL_FMLA) {
+  # Remove het_var from controls if it's in there
+  ctl_fmla_adj <- gsub(paste0("\\+?\\s*", het_var, "\\s*"), "", ctl_fmla)
+
+  models <- lapply(yvars, \(yv) {
+    lm(as.formula(paste(yv, "~ comment_neg_tone * article_pos_tone *", het_var, ctl_fmla_adj)), data=df)
+  })
+  names(models) = yvars
+  models
+}
+
+plot_model_slopes <- function(models) {
+  lapply(models, plot_model_slope) %>% wrap_plots(
+    axes='collect',
+    guides='collect'
+  )
+}
+
+plot_het_slopes <- function(models, het_var, var='comment_neg_tone') {
+  lapply(models, \(m) {
+    plot_model_slope(m, var=var, byvars=c('article_pos_tone', het_var))
+  }) %>% wrap_plots(axes='collect', guides='collect')
+}
+
+plot_adj_means <- function(models) {
+  lapply(models, \(m) {
+    plot_predictions(m, by = c("article_pos_tone", "comment_neg_tone"))
+  }) %>% wrap_plots(axes='collect', guides='collect')
+}
+```
+
+# Descriptives
+```{r}
+nrow(df)
+df %>% count(comment_neg_tone, article_pos_tone)
+df$will_of_ppl %>% hist
+df$good_corrupt %>% hist
+df$system_stacked %>% hist
+df$news_trust_post %>% hist
+df$trust_experts_rev %>% hist
+df$power_improve_rev %>% hist
+
+# Calculate Cronbach's alpha
+psych::alpha(df %>% select(will_of_ppl, power_improve_rev, system_stacked, trust_experts_rev, good_corrupt))$total$raw_alpha
+psych::alpha(df %>% select(will_of_ppl, system_stacked, good_corrupt))$total$raw_alpha
+
+# Correlations
+cor(df %>% select(will_of_ppl, power_improve_rev, system_stacked, trust_experts_rev, good_corrupt, news_trust_post))  %>% round(digits=2)
+cor(df %>% select(will_of_ppl, system_stacked, good_corrupt))  %>% round(digits=2)
+cor(df %>% select(power_improve_rev, trust_experts_rev, news_trust_post))  %>% round(digits=2)
+cor(df %>% select(power_improve_rev, trust_experts_rev, news_trust_post, system_stacked))  %>% round(digits=2)
+
+
+df$Q_pid3 %>% table %>% prop.table
+df$faminc_num %>% hist
+df$Age %>% as.numeric %>% hist
+```
+
+# Main Results
+
+```{r}
+models <- get_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'econ_post_z', 'cmneg'))
+plot_adj_means(models)
+ggsave(imgdir('pilot-coefplot-preds'), width=8, height=4)
+plot_model_slopes(models)
+ggsave(imgdir('pilot-results-coefplot1'), width=8, height=4)
+
+modelsummary(models)
+modelsummary(models, keep=c('tone'), output='markdown')
+```
+
+# Populism Index Components
+
+```{r}
+models <- get_models(df, c('will_of_ppl', 'power_improve_rev', 'system_stacked', 'trust_experts_rev', 'good_corrupt'))
+modelsummary(models, keep=c('tone'), output='gt')
+```
+
+# Popularity Effects
+
+```{r}
+# With likes
+df <- df %>% mutate(likesHi = likes == 2)
+
+models_likes <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'econ_post_z', 'cmneg'), 'likesHi')
+
+# Plot heterogeneous effects by likes
+plot_het_slopes(models_likes, 'likesHi')
+ggsave(imgdir('likes-het'), width=10, height=6)
+
+# Table of coefficients
+modelsummary(models_likes, keep=c('likes'))
+
+# Sample sizes
+df %>% count(likesHi, comment_neg_tone, article_pos_tone)
+```
+
+# Income Level Het Effects
+
+```{r}
+# Create income categories
+df$faminc70k <- df$faminc_num >= 70000
+summary(df$faminc_num)
+
+# Models with income heterogeneity
+models_income <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'econ_post_z', 'cmneg'), 'faminc70k')
+
+# Plot 1: Effect of negative comments by income
+plot_het_slopes(models_income, 'faminc70k')
+ggsave(imgdir('income-het'), width=10, height=6)
+
+# Plot 2: Effect of positive article by income
+plot_het_slopes(models_income, 'faminc70k', var='article_pos_tone')
+ggsave(imgdir('income-het-2'), width=10, height=6)
+
+# Table of coefficients
+
+models_income <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'econ_post_z', 'cmneg'), 'faminc_num_log')
+modelsummary(models_income, keep=c('faminc'), output='gt')
+
+models_income_2 <- get_het_models(df, c('will_of_ppl_z', 'power_improve_rev_z', 'system_stacked_z', 'trust_experts_rev', 'good_corrupt_z', 'news_trust_post_z'), 'faminc_num_log')
+summary(models_income_2$news_trust_post_z)
+modelsummary(models_income_2, keep=c('faminc'), output=imgdir('faminc-het-table.png'))
+
+df %>% ggplot(aes(x=system_stacked)) + geom_histogram() + facet_wrap(~group)
+df %>% ggplot(aes(x=trust_experts_rev)) + geom_histogram() + facet_wrap(~group)
+etable(
+  feols(trust_experts_rev ~ comment_neg_tone * article_pos_tone, data=df),
+  feols(trust_experts_rev ~ factor(group), data=df)
+)
+etable(
+  feols(news_trust_post ~ comment_neg_tone * article_pos_tone, data=df),
+  feols(news_trust_post ~ factor(group), data=df),
+  feols(news_trust_post ~ comment_neg_tone * article_pos_tone, data=df %>% filter(faminc70k))
+)
+```
+
+# Economic Perceptions Het Effects
+
+```{r}
+# Models with econ_pre heterogeneity (automatically removed from controls)
+models_econ <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'econ_post'), 'econ_pre')
+
+# Plot 1: Effect of negative comments by baseline econ perceptions
+plot_het_slopes(models_econ, 'econ_pre', var='comment_neg_tone')
+ggsave(imgdir('econ-het-effects'), width=10, height=6)
+
+# Plot 2: Effect of positive article by baseline econ perceptions
+plot_het_slopes(models_econ, 'econ_pre', var='article_pos_tone')
+ggsave(imgdir('econ-het-effects-2'), width=10, height=6)
+
+# Table of coefficients
+modelsummary(models_econ, keep=c('econ_pre'), output='gt')
+modelsummary(models_econ, keep=c('econ_pre'), output='gt')
+```
+
+# news Int Het Effects
+
+```{r}
+# Models with econ_pre heterogeneity (automatically removed from controls)
+models <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'cmneg'), 'newsint')
+
+# Plot 1: Effect of negative comments by baseline econ perceptions
+plot_het_slopes(models, 'newsint', var='comment_neg_tone')
+ggsave(imgdir('newsint-het-effects'), width=10, height=6)
+
+# Table of coefficients
+modelsummary(models, keep=c('newsint'), output='gt')
+# So - high news int individuals have a larger populism GP effect? Interesting
+```
+
+# Party ID Het Effects
+
+```{r}
+# Models with econ_pre heterogeneity (automatically removed from controls)
+models <- get_het_models(df, c('populism_z_idx', 'populism_gp', 'populism_ae', 'cmneg'), 'Q_pid3')
+plot_het_slopes(models, 'Q_pid3', var='comment_neg_tone')
+
+# Table of coefficients
+modelsummary(models, keep=c('Q_pid3'), output='gt')
+# Independents and Republicans are less populist in response to the mismatch condition?
+# The effect is concentrated among Democrats
+# Interesting...
+models_pid3 <- get_het_models(df, c('will_of_ppl_z', 'power_improve_rev_z', 'system_stacked_z', 'trust_experts_rev', 'good_corrupt_z', 'news_trust_post_z'), 'Q_pid3')
+plot_het_slopes(models_pid3, 'Q_pid3', var='comment_neg_tone')
+modelsummary(models_pid3, keep=c('Q_pid3'), output='gt')
+```
+
+
+# Comment Effects
+
+```{r}
+models_comment <- get_models(df, c('comment_stance', 'comment_stance_na', 'comment'))
+
+# Plot marginal effects
+plot_model_slopes(models_comment)
+ggsave(imgdir('comment-tone'), width=10, height=6)
+
+# Table of coefficients
+modelsummary(models_comment, output='gt')
+```
+
+
+
+# Comparing effect sizes
+```{r, eval=F}
+# This is the effect of negative comments at negative vs positive articles
+# H1 says we basically only care about the TRUE condition - under this condition, negative comments cause more populism
+# We actually somehow can identify this even in the pilot data
+# Then, H2 is the same as the interaction but is also the difference between FALSE and TRUE here
+# Then, H3 is a comparison of effect sizes
+hypotheses(mdl, "comment_neg_toneTRUE - article_pos_toneTRUE >= 0")
+
+# Same as looking at the following:
+
+# Effect of changing comments
+rbind(
+  slopes(mdl, variables="comment_neg_tone",
+         newdata=datagrid(article_pos_tone=T)),
+  # Effect of changing article
+  slopes(mdl, variables="article_pos_tone",
+         newdata=datagrid(comment_neg_tone=T))
+) %>% as_tibble()  %>% ggplot(aes(x=term, y=estimate, ymin=conf.low, ymax=conf.high)) + geom_errorbar(width=0) + geom_point() + theme_bw()
+rbind(
+  slopes(mdl.e, variables="comment_neg_tone",
+         newdata=datagrid(article_pos_tone=T)),
+  # Effect of changing article
+  slopes(mdl.e, variables="article_pos_tone",
+         newdata=datagrid(comment_neg_tone=T))
+) %>% as_tibble()  %>% ggplot(aes(x=term, y=estimate, ymin=conf.low, ymax=conf.high)) + geom_errorbar(width=0) + geom_point() + theme_bw()
+rbind(
+  slopes(mdl.n, variables="comment_neg_tone",
+         newdata=datagrid(article_pos_tone=T)),
+  # Effect of changing article
+  slopes(mdl.n, variables="article_pos_tone",
+         newdata=datagrid(comment_neg_tone=T))
+) %>% as_tibble()  %>% ggplot(aes(x=term, y=estimate, ymin=conf.low, ymax=conf.high)) + geom_errorbar(width=0) + geom_point() + theme_bw()
+```
+
+
+# Inspect covariates and index values
+```{r}
+# Check R2 power
+etable(
+  feols(
+    populism_idx ~ pop_pre + faminc_num + econ_pre + newsint + pers1 + pers2 + pers3 + pers4 + Q_pid3 + age + Sex + race + unemp, data=df
+  ),
+  feols(
+    populism_z_idx ~ pop_pre + faminc_num + econ_pre + newsint + pers1 + pers2 + pers3 + pers4 + Q_pid3, data=df
+  ),
+  digits=2
+)
+
+summary(lm(econ_post ~ factor(group) + econ_pre + newsint + pers1 + pers2 + pers3 + pers4, data=df))
+summary(lm(news_trust_post ~ factor(group) + econ_pre + newsint + pers1 + pers2 + pers3 + pers4, data=df))
+# Gut check correlations to make sure data makes sense
+# Populism items are correlated with each other
+ggcorrplot(cor(df %>% select(pop1, pop2, pop3, pop4, pop5, populism_z_idx)))
+ggcorrplot(cor(df %>% select(pers1, pers2, pers3, pers4, econ_pre, pop_pre, newsint, faminc_num, populism_z_idx), use='complete'))
+# Populism pre and, econ_pre, faminc, pers3 and pers4. 
+# Pers3 is "sympathetic and warm"
+# So, literally the opposite of what the people said
+# pers1 seems useless
+```

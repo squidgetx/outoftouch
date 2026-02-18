@@ -1,0 +1,830 @@
+---
+title: "Pooled Pilot Analysis: Article Tone Effects"
+output:  
+  html_document: 
+    toc: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+pacman::p_load(tidyverse, here, fixest, modelsummary, marginaleffects, patchwork)
+imgdir <- function(img) {
+  paste0('~/workspace/populism_comments/figures/', img, '.png')
+}
+# Define levels
+pop_levels <- c('Strongly Disagree', 'Somewhat Disagree', 'Neither', 'Somewhat Agree', 'Strongly Agree')
+econ_levels <- c('Much Worse', 'Somewhat Worse', 'About the Same', 'Somewhat Better', 'Much Better')
+personality_levels <- c('Disagree strongly', 'Disagree moderately', 'Neither agree nor disagree', 'Agree moderately', 'Agree strongly')
+newsint_levels <- c('Hardly at all', 'Only now and then', 'Some of the time', 'Most of the time')
+news_trust_levels <- c('Not at all', 'Not too much', 'Some', 'A fair amount', 'A lot')
+article_levels <- c("Don't trust at all", 'Trust very little', 'Trust a little', 'Trust a moderate amount', 'Trust a great deal')
+
+options(
+  modelsummary_fmt = fmt_decimal(digits=2),
+  modelsummary_stars = TRUE,
+  modelsummary_gof_map = c('nobs', 'r.squared')
+)
+```
+
+# Load and Harmonize Data
+
+```{r}
+# Load Prolific demographics (or create if doesn't exist)
+demo_file <- here('experiment/data/prolific_demographics_clean.rds')
+if (!file.exists(demo_file)) {
+  cat("Creating cleaned demographic data...\n")
+  source(here('experiment/clean_prolific_demographics.R'))
+} else {
+  cat("Loading existing cleaned demographic data...\n")
+}
+demo <- readRDS(demo_file)
+
+# Pilot 1: Original pilot
+df_p1 <- read_csv(here('experiment/data/populism and news_January 30, 2026_13.27.csv')) %>%
+  mutate(
+    pilot = 'pilot1',
+    article_positive = group %in% c(1,2),  # Groups 1,2 = positive article
+    comment_negative = group %in% c(1,3)   # Groups 1,3 = negative comments
+  )
+
+# Pilot 2: With extended populism items
+df_p2 <- read_csv(here('experiment/data/populism and news3.csv')) %>%
+  filter(!is.na(Q_second_order_1)) %>%  # Filter to complete responses
+  mutate(
+    pilot = 'pilot2',
+    article_positive = group %in% c(1,2),
+    comment_negative = group %in% c(1,3)
+  )
+
+# Pilot 3: Different treatment variable structure
+df_p3 <- read_csv(here('experiment/data/pilot3.csv')) %>%
+  mutate(
+    pilot = 'pilot3',
+    Q_personality_1 = NA,
+    Q_personality_2 = NA,
+    Q_personality_3 = NA,
+    Q_personality_4 = NA,
+    article_positive = tone == 1,  # tone: 1=positive, 0=negative
+    comment_negative = NA  # No comment manipulation in pilot 3
+  )
+
+# Combine datasets
+df <- bind_rows(df_p1, df_p2, df_p3)
+
+# Merge with Prolific demographics
+df <- df %>%
+  left_join(demo, by = c('PROLIFIC_PID' = 'participant_id'))
+
+cat("Total observations:", nrow(df), "\n")
+```
+
+# Create Outcome Variables
+
+```{r}
+df <- df %>%
+  mutate(
+    # Core 5 populism items (available in all pilots)
+    will_of_ppl = ordered(Q_pop1, levels=pop_levels) %>% as.numeric(),
+    power_improve_rev = ordered(Q_pop2, levels=rev(pop_levels)) %>% as.numeric(),
+    system_stacked = ordered(Q_pop3, levels=pop_levels) %>% as.numeric(),
+    trust_experts_rev = ordered(Q_pop4, levels=rev(pop_levels)) %>% as.numeric(),
+    good_corrupt = ordered(Q_pop5, levels=pop_levels) %>% as.numeric(),
+
+    # Extended populism items (pilot 2 & 3 only)
+    leader_represent = ordered(Q_pop6, levels=pop_levels) %>% as.numeric(),
+    ordinary_represent_rev = ordered(Q_pop7, levels=rev(pop_levels)) %>% as.numeric(),
+    ordinary_policies_rev = ordered(Q_pop8, levels=rev(pop_levels)) %>% as.numeric(),
+    rely_experts_too_much = ordered(Q_pop9, levels=pop_levels) %>% as.numeric(),
+    experts_claim = ordered(Q_pop10, levels=pop_levels) %>% as.numeric(),
+    unfair_system = ordered(Q_pop11, levels=pop_levels) %>% as.numeric(),
+
+    # Economic perceptions (consistent across all pilots)
+    econ_pre = ordered(Q_econ_pre, levels=econ_levels) %>% as.numeric(),
+    econ_post = ordered(Q_econ_post, levels=econ_levels) %>% as.numeric(),
+
+    # Demographics: Party ID
+    # Pilot 1: from survey Q_pid3
+    # Pilots 2 & 3: from Prolific demographics (party_dem, party_rep, party_ind)
+    pid_democrat = coalesce(party_dem, as.numeric(Q_pid3 == 'Democrat')),
+    pid_republican = coalesce(party_rep, as.numeric(Q_pid3 == 'Republican')),
+    pid_independent = coalesce(party_ind, as.numeric(Q_pid3 == 'Independent')),
+
+    # Demographics: Income/SES
+    # Pilots 1 & 2: from survey Q_faminc (actual income)
+    # Pilots 2 & 3: from Prolific ses_scale (perceived SES, 1-10)
+    faminc_survey = str_extract(Q_faminc, "\\d[\\d,]*") %>% str_remove(',') %>% as.numeric(),
+    faminc_log = log(faminc_survey + 1),
+    income_high = faminc_survey >= 70000,
+
+    # Personality/pre-treatment measures (pilots 1 & 2)
+    pers1 = ordered(Q_personality_1, levels=personality_levels) %>% as.numeric(),
+    pers2 = ordered(Q_personality_2, levels=personality_levels) %>% as.numeric(),
+    pers3 = ordered(Q_personality_3, levels=personality_levels) %>% as.numeric(),
+    pers4 = ordered(Q_personality_4, levels=personality_levels) %>% as.numeric(),
+
+    # News interest (pilots 1 & 2)
+    newsint = ordered(Q_newsint, levels=newsint_levels) %>% as.numeric(),
+
+    # News trust (pilots 1 & 2) - reverse coded so higher = less trust
+    news_trust_rev = ordered(Q_news_trust, levels=rev(news_trust_levels)) %>% as.numeric(),
+
+    # Article trust (pilots 2 & 3)
+    article_trust = ordered(Q_article_trust, levels=article_levels) %>% as.numeric(),
+
+    # Composite indices
+    populism_5item = (will_of_ppl + power_improve_rev + system_stacked + trust_experts_rev + good_corrupt) / 5,
+
+    # Standardized versions (core 5 items)
+    will_of_ppl_z = as.numeric(scale(will_of_ppl)),
+    power_improve_rev_z = as.numeric(scale(power_improve_rev)),
+    system_stacked_z = as.numeric(scale(system_stacked)),
+    trust_experts_rev_z = as.numeric(scale(trust_experts_rev)),
+    good_corrupt_z = as.numeric(scale(good_corrupt)),
+    econ_post_z = as.numeric(scale(econ_post)),
+
+    # Standardized versions (extended items)
+    leader_represent_z = as.numeric(scale(leader_represent)),
+    ordinary_represent_rev_z = as.numeric(scale(ordinary_represent_rev)),
+    ordinary_policies_rev_z = as.numeric(scale(ordinary_policies_rev)),
+    rely_experts_too_much_z = as.numeric(scale(rely_experts_too_much)),
+    experts_claim_z = as.numeric(scale(experts_claim)),
+    unfair_system_z = as.numeric(scale(unfair_system)),
+    news_trust_rev_z = as.numeric(scale(news_trust_rev)),
+    article_trust_z = as.numeric(scale(article_trust)),
+
+    # Factor scores from EFA (pilot 2 & 3 only, 7-item model)
+    populism_pc = (will_of_ppl_z + good_corrupt_z + leader_represent_z + system_stacked_z) / 4,  # People-centric (legacy)
+    populism_ae = (trust_experts_rev_z + experts_claim_z + rely_experts_too_much_z) / 3,  # Anti-elitism (legacy)
+
+    # Pre-registered outcome scales (pilots 2 & 3 only for populism; see prereg-draft.md)
+    # Scale 1: Perceived Representation Gap (other-regarding)
+    #   Pilot-available items: will_of_ppl, good_corrupt, leader_represent
+    #   New items for full study: politicians_challenges
+    populism = (will_of_ppl_z + good_corrupt_z + leader_represent_z) / 3,
+
+    # Scale 2: Perceived Elite Unresponsiveness (self-referential)
+    #   Pilot-available item: system_stacked
+    #   New items for full study: public_officials, econ_reality, rich_powerful
+    elite_unresponsive = system_stacked_z,  # single-item proxy
+
+    # Scale 3: Epistemic Distrust (pilots 2 & 3 version, 3 items)
+    #   Pilot-available items: trust_experts_rev, experts_claim, rely_experts_too_much
+    #   Full study will use: trust_experts_rev, experts_claim, news_trust
+    epistemic_distrust = (trust_experts_rev_z + experts_claim_z + rely_experts_too_much_z) / 3,
+
+    # Pilots 1 & 2 versions (common items across both pilots)
+    # populism_p12: only will_of_ppl and good_corrupt are common (leader_represent is p2+ only)
+    populism_p12 = (will_of_ppl_z + good_corrupt_z) / 2,
+    # elite_unresponsive_p12: same as elite_unresponsive (system_stacked available in all)
+    elite_unresponsive_p12 = system_stacked_z,
+    # epistemic_distrust_p12: only news_trust_rev is common across pilots 1 & 2
+    # (trust_experts_rev behaved oddly in pilot 1; experts_claim/rely_experts are p2+ only)
+    epistemic_distrust_p12 = news_trust_rev_z,
+  )
+
+# Check demographic coverage
+cat("\n=== Demographic Variable Coverage ===\n")
+cat("Party ID:", sum(!is.na(df$pid_democrat)), "/", nrow(df), "\n")
+cat("Survey Income (pilots 1 & 2):", sum(!is.na(df$faminc_survey)), "/", nrow(df), "\n")
+cat("Prolific SES (pilots 2 & 3):", sum(!is.na(df$ses_scale)), "/", nrow(df), "\n")
+```
+
+# Sample Descriptives
+
+```{r}
+# Sample sizes by pilot
+df %>% count(pilot, article_positive) %>%
+  pivot_wider(names_from = article_positive, values_from = n, names_prefix = "Article_pos_") %>%
+  knitr::kable(caption = "Sample sizes by pilot and article tone")
+
+# Overall sample
+cat("\n=== Overall Sample ===\n")
+cat("Total N:", nrow(df), "\n")
+cat("N by pilot:\n")
+print(table(df$pilot))
+
+psych::alpha(df %>% select(will_of_ppl, power_improve_rev, system_stacked, trust_experts_rev, good_corrupt))$total$raw_alpha
+```
+
+# Comment Main Effects (Pilots 1 & 2)
+
+```{r}
+covs_p12_sat <- "comment_negative + article_positive + pilot + econ_pre + pid_democrat + pid_republican + faminc_log + age + female + white + newsint + pers1 + pers2 + pers3 + pers4"
+covs_p2 <- "comment_negative + article_positive + econ_pre + pid_democrat + pid_republican + faminc_log + age + female + white + newsint + pers1 + pers2 + pers3 + pers4"
+
+models_comment_saturated <- list(
+  "Populism" = lm(as.formula(paste("populism_p12 ~", covs_p12_sat)), data=df),
+  "Elite Unresponsive" = lm(as.formula(paste("elite_unresponsive_p12 ~", covs_p12_sat)), data=df),
+  "Media Distrust" = lm(as.formula(paste("news_trust_rev_z ~", covs_p12_sat)), data=df),
+  "Econ Post" = lm(as.formula(paste("econ_post_z ~", covs_p12_sat)), data=df),
+  "Econ Second Order (Rev)" = lm(as.formula(paste("Q_second_order_1 ~", covs_p2)), data=df)
+)
+
+modelsummary(models_comment_saturated,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|article_positive|age|female|white|faminc_log|newsint|pers",
+             title = "Comment Tone Effects: Saturated Controls (Pilots 1 & 2)",
+             output = imgdir('comment.main.effects.pilot'))
+```
+
+# Mismatch Analysis: Article × Comment Interaction (Pilots 1 & 2)
+
+Testing whether article tone moderates the effect of comment tone (the mismatch hypothesis). Only pilots 1 & 2 included the comment manipulation.
+
+Pilot 1 & 2 common scale definitions:
+- **Populism (2 items)**: will_of_ppl, good_corrupt (leader_represent is pilot 2+ only)
+- **Elite Unresponsive (1 item)**: system_stacked
+- **Epistemic Distrust (1 item)**: news_trust_rev (trust_experts_rev behaved oddly in pilot 1; experts_claim and rely_experts_too_much are pilot 2+ only)
+
+```{r}
+df_p12 <- df %>% filter(pilot %in% c('pilot1', 'pilot2'))
+df_p23 <- df %>% filter(pilot %in% c('pilot2', 'pilot3'))
+
+covs_p12_int <- "pilot + econ_pre + pid_democrat + pid_republican + faminc_log + age + female + white + newsint + pers1 + pers2 + pers3 + pers4"
+
+models_interaction <- list(
+  "Populism" = lm(as.formula(paste("populism_p12 ~ article_positive * comment_negative +", covs_p12_int)), data=df_p12),
+  "Elite Unresponsive" = lm(as.formula(paste("elite_unresponsive_p12 ~ article_positive * comment_negative +", covs_p12_int)), data=df_p12),
+  "Media Distrust" = lm(as.formula(paste("epistemic_distrust_p12 ~ article_positive * comment_negative +", covs_p12_int)), data=df_p12),
+  "Econ Post" = lm(as.formula(paste("econ_post_z ~ article_positive * comment_negative +", covs_p12_int)), data=df_p12)
+)
+
+modelsummary(models_interaction,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white|faminc_log|newsint|pers",
+             output = imgdir('mismatch_pilot12.table.png'),
+             title = "Article × Comment Interaction: Pre-Registered Scales (Pilots 1 & 2)")
+```
+
+# Heterogeneous Effects: Article Tone by Economic Perceptions (All Pilots)
+
+Testing whether the effect of article tone varies by pre-treatment economic perceptions (econ_pre). Higher econ_pre = better economic outlook pre-treatment.
+
+```{r}
+models_het_econ_saturated <- list(
+  "Populism" = lm(populism ~ article_positive * econ_pre + pilot +
+                        pid_democrat + pid_republican + age + female + white, data=df),
+  "Elite Responsiveness" = lm(system_stacked_z ~ article_positive * econ_pre + pilot +
+                          pid_democrat + pid_republican + age + female + white, data=df),
+  "Media Trust" = lm(news_trust_rev_z ~ article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican + age + female + white, data=df),
+  "Econ Post" = lm(econ_post_z ~ article_positive * econ_pre + pilot +
+                     pid_democrat + pid_republican + age + female + white, data=df)
+)
+
+modelsummary(models_het_econ_saturated,
+             stars = TRUE,
+             coef_omit = "pilot|pid_|age|female|white",
+             title = "Article Tone × Economic Perceptions: Saturated Controls (All Pilots)")
+
+names(models_het_econ_saturated) %>% map(function(nm) {
+  plot_slopes(models_het_econ_saturated[[nm]],
+              variables = "article_positive",
+              condition = c("econ_pre")) +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Positive Article", x = "Econ Perceptions (Pre)") +
+    theme_minimal()
+}) %>% wrap_plots()
+ggsave(imgdir('article.main.het.pilot'), width=7, height=7)
+```
+
+# Heterogeneous Comment Tone Effects by Econ_pre (Pilots 1 & 2)
+
+## Comment Tone × Econ_pre
+
+```{r}
+# Comment × econ_pre interaction (pre-registered scales)
+models_het_comment_econ_p12 <- list(
+  "Populism" = lm(populism_p12 ~ comment_negative * econ_pre + article_positive + pilot +
+                   pid_democrat + pid_republican, data=df_p12),
+  "Elite Unresponsive" = lm(elite_unresponsive_p12 ~ comment_negative * econ_pre + article_positive + pilot +
+                              pid_democrat + pid_republican, data=df_p12),
+  "Media Distrust" = lm(epistemic_distrust_p12 ~ comment_negative * econ_pre + article_positive + pilot +
+                              pid_democrat + pid_republican, data=df_p12),
+  "Econ Post" = lm(econ_post_z ~ comment_negative * econ_pre + article_positive + pilot +
+                     pid_democrat + pid_republican, data=df_p12),
+  "Econ Second Order (Rev)" = lm(Q_second_order_1 ~ comment_negative * econ_pre + article_positive + pid_democrat + pid_republican, data=df_p12)
+)
+
+modelsummary(models_het_comment_econ_p12,
+             stars = TRUE,
+             coef_omit = "pilot|pid_|article_positive",
+             title = "Comment Tone × Economic Perceptions: Pre-Registered Scales (Pilots 1 & 2)")
+```
+
+```{r fig.width=10, fig.height=8}
+plots_het_comment_econ_p12 <- names(models_het_comment_econ_p12) %>% map(function(nm) {
+  plot_slopes(models_het_comment_econ_p12[[nm]],
+              variables = "comment_negative",
+              condition = "econ_pre") +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Negative Comments", x = "Econ Perceptions (Pre)") +
+    theme_minimal()
+})
+
+wrap_plots(plots_het_comment_econ_p12, ncol = 2, guides='collect')
+ggsave(imgdir('comment.main.het.pilot'), width=7, height=7)
+
+```
+
+## Triple Interaction: Comment × Article × Econ_pre (Mismatch Het Effects)
+
+```{r}
+# Triple interaction: comment_negative × article_positive × econ_pre
+models_triple_p12 <- list(
+  "Populism" = lm(populism_p12 ~ comment_negative * article_positive * econ_pre + pilot +
+                   pid_democrat + pid_republican, data=df_p12),
+  "Elite Unresponsive" = lm(elite_unresponsive_p12 ~ comment_negative * article_positive * econ_pre + pilot +
+                              pid_democrat + pid_republican, data=df_p12),
+  "Media Distrust" = lm(epistemic_distrust_p12 ~ comment_negative * article_positive * econ_pre + pilot +
+                              pid_democrat + pid_republican, data=df_p12),
+  "Econ Post" = lm(econ_post_z ~ comment_negative * article_positive * econ_pre + pilot +
+                     pid_democrat + pid_republican, data=df_p12)
+)
+
+modelsummary(models_triple_p12,
+             stars = TRUE,
+             output = imgdir('mismatch.econpre.pilot12.table.png'),
+             coef_omit = "pilot|pid_",
+             title = "Triple Interaction: Pre-Registered Scales (Pilots 1 & 2)")
+```
+
+```{r fig.width=10, fig.height=8}
+plots_triple_p12 <- names(models_triple_p12) %>% map(function(nm) {
+  plot_slopes(models_triple_p12[[nm]],
+              variables = "comment_negative",
+              condition = c("econ_pre", "article_positive")) +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Negative Comments", x = "Econ Perceptions (Pre)", color='Article Positive', fill='Article Positive') +
+    theme_minimal()
+})
+
+wrap_plots(plots_triple_p12, ncol = 2, guides='collect') 
+ggsave(imgdir('mismatch.het.mfx.pilot12.png'), width=8, height=8)
+```
+
+## Triple Interaction: Individual Items (for reference)
+
+```{r fig.width=10, fig.height=10}
+models_triple_items_p12 <- list(
+  "Will of People" = lm(will_of_ppl_z ~ comment_negative * article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican, data=df_p12),
+  "Good vs Corrupt" = lm(good_corrupt_z ~ comment_negative * article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican, data=df_p12),
+  "System Stacked" = lm(system_stacked_z ~ comment_negative * article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican, data=df_p12),
+  "News Trust (rev)" = lm(news_trust_rev_z ~ comment_negative * article_positive * econ_pre + pilot +
+                            pid_democrat + pid_republican, data=df_p12)
+)
+
+plots_triple_items <- names(models_triple_items_p12) %>% map(function(nm) {
+  plot_slopes(models_triple_items_p12[[nm]],
+              variables = "comment_negative",
+              condition = c("econ_pre", "article_positive")) +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Negative Comments", x = "Econ Perceptions (Pre)") +
+    theme_minimal()
+})
+
+wrap_plots(plots_triple_items, ncol = 2, guides='collect')
+```
+
+
+## Individual Items (for reference)
+
+```{r}
+models_comment_items <- list(
+  "Will of People" = lm(as.formula(paste("will_of_ppl_z ~", covs_p12_sat)), data=df_p12),
+  "Good vs Corrupt" = lm(as.formula(paste("good_corrupt_z ~", covs_p12_sat)), data=df_p12),
+  "System Stacked" = lm(as.formula(paste("system_stacked_z ~", covs_p12_sat)), data=df_p12),
+  "News Trust (rev)" = lm(as.formula(paste("news_trust_rev_z ~", covs_p12_sat)), data=df_p12),
+  "Power Improve (rev)" = lm(as.formula(paste("power_improve_rev_z ~", covs_p12_sat)), data=df_p12)
+)
+
+modelsummary(models_comment_items,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|article_positive|age|female|white|faminc_log|newsint|pers",
+             title = "Comment Tone Effects: Individual Items (Pilots 1 & 2)")
+```
+
+# Article Tone Analysis: All Pilots (5 Common Items)
+
+Analyzing the effect of article tone on the 5 core populism items available across all pilots.
+
+## Basic Controls (Econ Pre + Party ID)
+
+```{r}
+models_core_basic <- list(
+  "5-Item Index" = lm(populism_5item ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "Will of People" = lm(will_of_ppl_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "Power Improve (rev)" = lm(power_improve_rev_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "System Stacked" = lm(system_stacked_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "Trust Experts (rev)" = lm(trust_experts_rev_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "Good vs Corrupt" = lm(good_corrupt_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df),
+  "Econ Post" = lm(econ_post_z ~ article_positive + pilot + econ_pre + pid_democrat + pid_republican, data=df)
+)
+
+modelsummary(models_core_basic,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_",
+             title = "Article Tone Effects: Basic Controls (All Pilots)")
+```
+
+## Saturated Controls (+ Age, Gender, Race, Employment)
+
+```{r}
+models_core_saturated <- list(
+  "5-Item Index" = lm(populism_5item ~ article_positive + pilot + econ_pre +
+                        pid_democrat + pid_republican + age + female + white , data=df),
+  "Will of People" = lm(will_of_ppl_z ~ article_positive + pilot + econ_pre +
+                          pid_democrat + pid_republican + age + female + white , data=df),
+  "Power Improve (rev)" = lm(power_improve_rev_z ~ article_positive + pilot + econ_pre +
+                               pid_democrat + pid_republican + age + female + white , data=df),
+  "System Stacked" = lm(system_stacked_z ~ article_positive + pilot + econ_pre +
+                          pid_democrat + pid_republican + age + female + white , data=df),
+  "Trust Experts (rev)" = lm(trust_experts_rev_z ~ article_positive + pilot + econ_pre +
+                               pid_democrat + pid_republican + age + female + white , data=df),
+  "Good vs Corrupt" = lm(good_corrupt_z ~ article_positive + pilot + econ_pre +
+                           pid_democrat + pid_republican + age + female + white , data=df),
+  "Econ Post" = lm(econ_post_z ~ article_positive + pilot + econ_pre +
+                     pid_democrat + pid_republican + age + female + white , data=df)
+)
+
+modelsummary(models_core_saturated,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white",
+             title = "Article Tone Effects: Saturated Controls (All Pilots)")
+```
+
+# Article Tone: Pilots 2 & 3 (Pre-Registered Outcome Scales)
+
+Using the pre-registered outcome scale structure (see prereg-draft.md §4):
+- **Representation Gap (3 items, other-regarding)**: will_of_ppl, good_corrupt, leader_represent
+- **Elite Unresponsiveness (1 item proxy, self-referential)**: system_stacked
+- **Epistemic Distrust (3 items)**: trust_experts_rev, experts_claim, rely_experts_too_much
+
+Note: The full study adds items not available in pilots (politicians_challenges, public_officials, econ_reality, rich_powerful, news_trust). Legacy people-centric and anti-elitism scales are retained for comparison.
+
+```{r}
+# Pre-registered scales
+covs <- "article_positive + pilot + econ_pre + pid_democrat + pid_republican + age + female + white + education + ses_scale"
+
+models_p23_prereg <- list(
+   "Populism" = lm(as.formula(paste("populism ~", covs)), data=df_p23),
+   "Elite Unresponsive" = lm(as.formula(paste("elite_unresponsive ~", covs)), data=df_p23),
+   "Epistemic Distrust" = lm(as.formula(paste("epistemic_distrust ~", covs)), data=df_p23),
+   "Article Trust" = lm(as.formula(paste("article_trust_z ~", covs)), data=df_p23),
+   "Econ Post" = lm(as.formula(paste("econ_post_z ~", covs)), data=df_p23)
+)
+
+modelsummary(models_p23_prereg,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white|education|ses_scale",
+             title = "Pre-Registered Scales: Saturated Controls (Pilots 2 & 3)")
+
+# Legacy scales for comparison
+models_p23_legacy <- list(
+   "People-Centric Scale" = lm(as.formula(paste("populism_pc ~", covs)), data=df_p23),
+   "Anti-Elitism Scale" = lm(as.formula(paste("populism_ae ~", covs)), data=df_p23),
+   "Article Trust" = lm(as.formula(paste("article_trust_z ~", covs)), data=df_p23),
+   "Econ Post" = lm(as.formula(paste("econ_post_z ~", covs)), data=df_p23)
+)
+
+modelsummary(models_p23_legacy,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white|education|ses_scale",
+             title = "Legacy Scales: Saturated Controls (Pilots 2 & 3)")
+
+# Individual populism items (+ education + SES)
+models_p23_extended <- list(
+  "Will of People" = lm(will_of_ppl_z ~ article_positive + pilot + econ_pre +
+                          pid_democrat + pid_republican + age + female + white +
+                          education + ses_scale, data=df_p23),
+  "Good vs Corrupt" = lm(good_corrupt_z ~ article_positive + pilot + econ_pre +
+                           pid_democrat + pid_republican + age + female + white +
+                           education + ses_scale, data=df_p23),
+  "Leader Represent" = lm(leader_represent_z ~ article_positive + pilot + econ_pre +
+                            pid_democrat + pid_republican + age + female + white +
+                            education + ses_scale, data=df_p23),
+  "System Stacked" = lm(system_stacked_z ~ article_positive + pilot + econ_pre +
+                          pid_democrat + pid_republican + age + female + white +
+                          education + ses_scale, data=df_p23),
+  "Trust Experts (rev)" = lm(trust_experts_rev_z ~ article_positive + pilot + econ_pre +
+                               pid_democrat + pid_republican + age + female + white +
+                               education + ses_scale, data=df_p23),
+  "Experts Claim" = lm(experts_claim_z ~ article_positive + pilot + econ_pre +
+                         pid_democrat + pid_republican + age + female + white +
+                         education + ses_scale, data=df_p23),
+  "Rely on Experts" = lm(rely_experts_too_much_z ~ article_positive + pilot + econ_pre +
+                           pid_democrat + pid_republican + age + female + white +
+                           education + ses_scale, data=df_p23)
+)
+
+modelsummary(models_p23_extended,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white|education|ses_scale",
+             title = "Extended Items: Saturated Controls (Pilots 2 & 3)")
+```
+
+# Article Tone: Pilots 1 & 2 (With Survey Income)
+
+Using survey income data available in pilots 1 & 2.
+
+```{r}
+covs_p12_full <- "article_positive + pilot + econ_pre + pid_democrat + pid_republican + faminc_log + age + female + white + newsint + pers1 + pers2 + pers3 + pers4"
+
+models_p12_income <- list(
+  "Populism" = lm(as.formula(paste("populism_p12 ~", covs_p12_full)), data=df_p12),
+  "Elite Unresponsive" = lm(as.formula(paste("elite_unresponsive_p12 ~", covs_p12_full)), data=df_p12),
+  "Epistemic Distrust" = lm(as.formula(paste("epistemic_distrust_p12 ~", covs_p12_full)), data=df_p12),
+  "Econ Post" = lm(as.formula(paste("econ_post_z ~", covs_p12_full)), data=df_p12)
+)
+
+modelsummary(models_p12_income,
+             stars = TRUE,
+             coef_omit = "pilot|econ_pre|pid_|age|female|white|faminc_log|newsint|pers",
+             title = "Article Tone Effects: Pre-Registered Scales (Pilots 1 & 2)")
+```
+
+
+## Pilots 2 & 3: Article Het Effects By Econ_pre
+
+```{r}
+models_het_econ_p23 <- list(
+  "Populism" = lm(populism ~ article_positive * econ_pre + pilot +
+                   pid_democrat + pid_republican, data=df_p23),
+  "Elite Unresponsive" = lm(elite_unresponsive ~ article_positive * econ_pre + pilot +
+                              pid_democrat + pid_republican, data=df_p23),
+  "Epistemic Distrust" = lm(epistemic_distrust ~ article_positive * econ_pre + pilot +
+                              pid_democrat + pid_republican, data=df_p23),
+  "Article Trust" = lm(article_trust_z ~ article_positive * econ_pre + pilot +
+                         pid_democrat + pid_republican, data=df_p23),
+  "Econ Post" = lm(econ_post_z ~ article_positive * econ_pre + pilot +
+                     pid_democrat + pid_republican, data=df_p23)
+)
+
+# Legacy scales for comparison
+models_het_econ_p23_legacy <- list(
+  "People-Centric Scale" = lm(populism_pc ~ article_positive * econ_pre + pilot +
+                                pid_democrat + pid_republican, data=df_p23),
+  "Anti-Elitism Scale" = lm(populism_ae ~ article_positive * econ_pre + pilot +
+                              pid_democrat + pid_republican, data=df_p23)
+)
+
+modelsummary(models_het_econ_p23,
+             stars = TRUE,
+             coef_omit = "pilot|pid_",
+             title = "Article Tone × Economic Perceptions: Pre-Registered Scales (Pilots 2 & 3)")
+
+modelsummary(models_het_econ_p23_legacy,
+             stars = TRUE,
+             coef_omit = "pilot|pid_",
+             title = "Article Tone × Economic Perceptions: Legacy Scales (Pilots 2 & 3)")
+```
+
+```{r fig.width=10, fig.height=8}
+# Marginal effect of article_positive at each level of econ_pre (1-5)
+plots_het <- names(models_het_econ_p23) %>% map(function(nm) {
+  p <- plot_slopes(models_het_econ_p23[[nm]],
+                   variables = "article_positive",
+                   condition = "econ_pre") +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Positive Article", x = "Econ Perceptions (Pre)") +
+    theme_minimal()
+  p
+})
+
+wrap_plots(plots_het, ncol = 2)
+```
+
+## Pilots 2 & 3: All Populism Items
+
+```{r}
+models_het_econ_p23_items <- list(
+  "Will of People" = lm(will_of_ppl_z ~ article_positive * econ_pre + pilot +
+                          pid_democrat + pid_republican, data=df_p23),
+  "Power Improve (rev)" = lm(power_improve_rev_z ~ article_positive * econ_pre + pilot +
+                               pid_democrat + pid_republican, data=df_p23),
+  "System Stacked" = lm(system_stacked_z ~ article_positive * econ_pre + pilot +
+                          pid_democrat + pid_republican, data=df_p23),
+  "Unfair System" = lm(unfair_system_z ~ article_positive * econ_pre + pilot +
+                         pid_democrat + pid_republican, data=df_p23),
+  "Good vs Corrupt" = lm(good_corrupt_z ~ article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican, data=df_p23),
+  "Leader Represent" = lm(leader_represent_z ~ article_positive * econ_pre + pilot +
+                            pid_democrat + pid_republican, data=df_p23),
+  "Ordinary Represent (rev)" = lm(ordinary_represent_rev_z ~ article_positive * econ_pre + pilot +
+                                    pid_democrat + pid_republican, data=df_p23),
+  "Ordinary Policies (rev)" = lm(ordinary_policies_rev_z ~ article_positive * econ_pre + pilot +
+                                   pid_democrat + pid_republican, data=df_p23),
+  "Rely on Experts" = lm(rely_experts_too_much_z ~ article_positive * econ_pre + pilot +
+                           pid_democrat + pid_republican, data=df_p23),
+  "Experts Claim" = lm(experts_claim_z ~ article_positive * econ_pre + pilot +
+                         pid_democrat + pid_republican, data=df_p23),
+ "Trust Experts (rev)" = lm(trust_experts_rev_z ~ article_positive * econ_pre + pilot +
+                               pid_democrat + pid_republican, data=df_p23)
+)
+
+modelsummary(models_het_econ_p23_items,
+             stars = TRUE,
+             coef_omit = "pilot|pid_",
+             title = "Article Tone × Economic Perceptions: All Items (Pilots 2 & 3)")
+```
+
+## Pilots 2 & 3: Het Effects By SES
+
+```{r}
+models_het_ses_p23 <- list(
+  "Populism" = lm(populism ~ article_positive * ses_scale + pilot +
+                   pid_democrat + pid_republican, data=df_p23),
+  "Elite Unresponsive" = lm(elite_unresponsive ~ article_positive * ses_scale + pilot +
+                              pid_democrat + pid_republican, data=df_p23),
+  "Epistemic Distrust" = lm(epistemic_distrust ~ article_positive * ses_scale + pilot +
+                              pid_democrat + pid_republican, data=df_p23),
+  "Article Trust" = lm(article_trust_z ~ article_positive * ses_scale + pilot +
+                         pid_democrat + pid_republican, data=df_p23),
+  "Econ Post" = lm(econ_post_z ~ article_positive * ses_scale + pilot +
+                     pid_democrat + pid_republican, data=df_p23)
+)
+
+modelsummary(models_het_ses_p23,
+             stars = TRUE,
+             coef_omit = "pilot|pid_",
+             title = "Article Tone × SES (Pilots 2 & 3)")
+```
+
+```{r fig.width=10, fig.height=8}
+plots_het_ses <- names(models_het_ses_p23) %>% map(function(nm) {
+  plot_slopes(models_het_ses_p23[[nm]],
+              variables = "article_positive",
+              condition = "ses_scale") +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    labs(title = nm, y = "Effect of Positive Article", x = "Perceived SES (1-10)") +
+    theme_minimal()
+})
+
+wrap_plots(plots_het_ses, ncol = 2)
+```
+
+## Disentangling: Reassurance vs. Activation
+
+Does the het effect come from positive articles reassuring optimists, or negative articles activating optimists?
+
+```{r fig.width=10, fig.height=12}
+# Split-sample: separate slopes of econ_pre on outcomes by treatment group
+outcomes_disentangle <- c("populism", "elite_unresponsive", "epistemic_distrust", "article_trust_z", "econ_post_z")
+outcome_labels <- c("Populism", "Elite Unresponsive", "Epistemic Distrust", "Article Trust", "Econ Post")
+
+plots_split <- map2(outcomes_disentangle, outcome_labels, function(outcome, label) {
+  df_plot <- df_p23 %>%
+    filter(!is.na(.data[[outcome]]), !is.na(econ_pre)) %>%
+    mutate(article_group = ifelse(article_positive, "Positive Article", "Negative Article"))
+
+  ggplot(df_plot, aes(x = econ_pre, y = .data[[outcome]])) +
+    geom_jitter(alpha = 0.3, width = 0.15, height = 0) +
+    geom_smooth(method = "lm", se = TRUE) +
+    facet_wrap(~article_group) +
+    geom_hline(yintercept = mean(df_plot[[outcome]], na.rm = TRUE), linetype = "dashed", alpha = 0.3) +
+    labs(title = label, x = "Econ Perceptions (Pre)", y = outcome) +
+    theme_minimal()
+})
+
+wrap_plots(plots_split, ncol = 2)
+```
+
+```{r}
+# Formal test: separate regressions by treatment group
+cat("=== Slopes of econ_pre on outcomes, by article condition ===\n\n")
+
+for (i in seq_along(outcomes_disentangle)) {
+  outcome <- outcomes_disentangle[i]
+  label <- outcome_labels[i]
+
+  f <- as.formula(paste0(outcome, " ~ econ_pre + pilot + pid_democrat + pid_republican"))
+
+  m_pos <- lm(f, data = df_p23 %>% filter(article_positive == TRUE))
+  m_neg <- lm(f, data = df_p23 %>% filter(article_positive == FALSE))
+
+  cat(label, ":\n")
+  cat("  Positive article: econ_pre coef =", round(coef(m_pos)["econ_pre"], 3),
+      "(SE =", round(summary(m_pos)$coefficients["econ_pre", "Std. Error"], 3), ")\n")
+  cat("  Negative article: econ_pre coef =", round(coef(m_neg)["econ_pre"], 3),
+      "(SE =", round(summary(m_neg)$coefficients["econ_pre", "Std. Error"], 3), ")\n\n")
+}
+```
+
+# Summary
+
+## Key Findings:
+
+**Positive Articles Increase Economic Perceptions**
+This effect is very consistent and thankfully not surprising. This tells us the manipulation is working.
+  
+**Positive Articles Decrease Populism**
+This effect is consistent across pilots and measurement strategies. Some items show stronger effects than others, but all items show a negative sign or are very small.
+
+The strongest effects are recorded for 
+- power_improve_rev "Elites and politicians use their power to improve people's lives
+- leader_represent "It's important for a political leader to be like the people he or she represents"
+- system_stacked "The system is stacked against people like me"
+
+**Positive Articles Decrease Populism More For More Optimistic Respondents**
+Across specifications and outcomes, the interaction of econ_pre is negative, indicating that as econ_pre increases, the effect of article_positive decreases further. 
+Similarly, while positive articles are generally perceived as untrustworthy, pre-treatment economic perception interaction is large and positive indicating that people with a positive outlook trust the article more (makes sense).
+The marginal effects plot suggests that the positive articles do not increase populism for pessimistic respondents. This could be attenuated by ceiling effects, though.
+
+```{r}
+# Pre-registered scale summaries
+cat("=== Pre-Registered Scale Summaries (Pilots 2 & 3) ===\n")
+cat("\nPopulism (other-regarding):\n")
+summary(df$populism)
+cat("\nElite Unresponsive (self-referential, single item):\n")
+summary(df$elite_unresponsive)
+cat("\nEpistemic Distrust:\n")
+summary(df$epistemic_distrust)
+
+cat("\n=== By econ_pre ===\n")
+df %>% filter(!is.na(populism)) %>%
+  group_by(econ_pre) %>%
+  summarize(
+    populism = mean(populism, na.rm=T),
+    elite_unresponsive = mean(elite_unresponsive, na.rm=T),
+    epistemic_distrust = mean(epistemic_distrust, na.rm=T),
+    .groups = 'drop'
+  ) %>% print()
+
+# Internal consistency for pilot-available items
+cat("\n=== Cronbach's Alpha (Pilots 2 & 3) ===\n")
+df_p23_alpha <- df %>% filter(pilot %in% c('pilot2', 'pilot3'))
+cat("Populism (will_of_ppl, good_corrupt, leader_represent): ",
+    psych::alpha(df_p23_alpha %>% select(will_of_ppl, good_corrupt, leader_represent))$total$raw_alpha, "\n")
+cat("Epistemic Distrust (trust_experts_rev, experts_claim, rely_experts_too_much): ",
+    psych::alpha(df_p23_alpha %>% select(trust_experts_rev, experts_claim, rely_experts_too_much))$total$raw_alpha, "\n")
+
+# Legacy for comparison
+cat("\nLegacy People-Centric (will_of_ppl, good_corrupt, leader_represent, system_stacked): ",
+    psych::alpha(df_p23_alpha %>% select(will_of_ppl, good_corrupt, leader_represent, system_stacked))$total$raw_alpha, "\n")
+```
+
+**Positive Article Has No Effect on News Trust**
+None that we can see so far, anyway. Should have put news trust in pilot 3, oops.
+
+**Negative Comments Decrease Economic Perceptions**
+This effect is very consistent and thankfully not surprising. This tells us the manipulation is working.
+
+**Negative Comments Increase Populism**
+This effect is consistent across pilots and measurement strategies. Some items show stronger effects than others, but all items show a positive sign or are null.
+
+The strongest effects are recorded for:
+- system_stacked
+- trust_experts
+- good_corrupt
+
+**Negative Comments Decrease News Trust**
+
+**Negative Comments Are Stronger For More Pessimistic Readers**
+Results are a little noisy, but it looks like populism increases most for pessimistic readers as a result of negative comments, similar for news trust and for economic perceptions.
+
+**Interaction of Negative Comments and Positive Articles Is Inconclusive**
+Large standard errors and mixed signs. 
+The most precise (but still, very insignificant) estimate is that the interaction is positive for economic perceptions, which is a bit strange because that suggests that negative comments DONT moderate economic perceptions when paired with news that people don't trust ???
+
+**Can we put it together?**
+So, we see positive articles "reassuring" people who already thought the economy was good. 
+Alternatively, we could say that negative articles are "activating" people who thought the economy was good. 
+So in some sense, there could be a "learning" story happening where people who think the economy is good are exposed to negative news and become more people-centric/anti-elite. 
+Can we figure out whether it's negative articles moving rich people more populist? Or positive articles moving rich people less populist? This seems important to figure out.
+Plotting slopes by condition is sort of useful, but ultimately we can only achieve this with design changes (pre-treatment populism, or pure control condition).
+
+For people who think the economy is bad, the positive news doesn't seem to move either populism in any direction. It's possible this is because of ceiling effects on populism or because they simply don't trust the news article. It's a little confusing because despite this, the effect of the news article on econ_post is fairly large. So people are updating, but not trusting, and also not showing effects on populism. 
+
+If we look at comments, we see that negative comments move the more pessimistic people in somewhat expected direction: they become more populist and distrustful of the media, and update more negatively toward pessimism.
+
+What do we make of the interaction being null/noisy? 
+I suppose a low econ_pre person experiencing this condition would become more populist just from the negative comments and possibly ignore the article. This could explain a null/noisy interaction. 
+But, the theory is that even if low econ_pre person doesn't link the article to elite failure right away, the negative comments would?
+
+## More discussion
+
+Hm. Could it be that high econ_pre responds to news and low econ pre responds to comments?
+This is consistent with the pattern of data. And is somewhat tautological but could be differentiated with better design. This could also explain why the interactions are so whack.
+
+Let's look at the triple interaction
+- Mismatch effect on populism is LARGER for high econ_pre
+- REVERSE is true for news (dis)trust. Mismatch is MORE effective on news_distrust for low econ_pre. For high econ_pre, the talk back effect doesn't really do anything. 
+- Econ post tells the clearest story. Flat line effect for negative articles, indicating that negative comments (when they reinforce) have a consistent effect. However, with a positive article, the effect of negative comments disappears for high econ pre people. 
+
+Looking at the individual populism components, we see the same pattern for will_of_ppl and good_corrupt and trust_experts basically. Power improve is sort of useless. System stacked is interesting. but I think the interaction direction is still sort of the same? Although - for all other outcomes, the slope on positive article is positive, meaning that as people move up econ_pre they become more susceptible to negative comments affecting them. But the opposite is true for system_stacked - they become less susceptible. Possibly again this is related to the idea that system_stacked is not "people like me" when it comes to high econ_pre.
+
+So... it SEEMS like what's happening is that 
+- rich people become more supportive of the people's suffering in the mismatch condition
+- however, this does NOT affect their media trust OR economic perceptions.
+- perhaps, they are able to hold in their minds the dual concept of "the economy is good but the people are suffering" which increases people-centric populism but does not affect their economic judgements or overall trust in media. This basically describes the "rich Zohran NYC voter" archetype.
+- by contrast, poor people dont seem to be that sensitive to the mismatch condition. perhaps this is because they think the article is fake so they dismiss it out of hand. or, it's because of ceiling effects. any negative information makes them more populist, distrustful of the media, and more pessimistic.
+- i am using poor and rich here but really the indicator is econ_pre.
+
+Contrasting with the original study plan, what are the takeaways?
+- Make sure to be able to distinguish this 'dual consciousness' story. (Stratify by econ_pre)
+- Consider what other outcomes are possible/plausible for the low econ_pre group. We actually see encouraging results for media trust, for example (which makes sense!)
+- Behavioral intentions could be interesting ()How likely are you to seek out news about the economy in the future?, Media intent - "Do you think the media tries to mislead people about the economy?
+
+

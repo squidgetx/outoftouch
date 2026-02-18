@@ -1,0 +1,127 @@
+---
+title: "Pilot 2 Analysis"
+output: pdf_document
+---
+
+```{r echo=F}
+pacman::p_load(tidyverse, here, stringr, psych)
+pacman::p_load(fixest, ggcorrplot, estimatr, marginaleffects, patchwork, modelsummary, knitr)
+  personality_levels <- c('Disagree strongly', 'Disagree moderately', 'Neither agree nor disagree', 'Agree moderately', 'Agree strongly')
+
+  econ_levels <- c('Much Worse', 'Somewhat Worse', 'About the Same', 'Somewhat Better', 'Much Better')
+  pop_levels <- c('Strongly Disagree', 'Somewhat Disagree', 'Neither', 'Somewhat Agree', 'Strongly Agree')
+  article_levels <- c("Don't trust at all", 'Trust very little', 'Trust a little', 'Trust a moderate amount', 'Trust a great deal')
+  conpress_levels <- c("Hardly any", 'Only some', 'A great deal')
+
+df <- read_csv(here('experiment/data/pilot3.csv')) %>% mutate(
+    article_trust = ordered(Q_article_trust, levels=article_levels) %>% as.numeric,
+    econ_pre = ordered(Q_econ_pre, levels=econ_levels) %>% as.numeric,
+    econ_post = ordered(Q_econ_post, levels=econ_levels) %>% as.numeric,
+    will_of_ppl = ordered(Q_pop1, levels=pop_levels) %>% as.numeric(),
+    # pop2: Politicians and elites use their power to try to improve people's lives (reverse coded)
+    power_improve_rev = ordered(Q_pop2, levels=rev(pop_levels)) %>% as.numeric(),
+    # pop3: The system is stacked against people like me
+    system_stacked = ordered(Q_pop3, levels=pop_levels) %>% as.numeric(),
+    # pop4: I'd rather put my trust in the opinions of experts than the wisdom of ordinary people (reverse coded)
+    trust_experts_rev = ordered(Q_pop4, levels=rev(pop_levels)) %>% as.numeric(),
+    # pop5: Politics is a fight between the good people and the corrupt elite
+    good_corrupt = ordered(Q_pop5, levels=pop_levels) %>% as.numeric(),
+    leader_represent = ordered(Q_pop6, levels=pop_levels) %>% as.numeric(),
+    ordinary_represent_rev = ordered(Q_pop7, levels=rev(pop_levels)) %>% as.numeric(),
+    ordinary_policies_rev = ordered(Q_pop8, levels=rev(pop_levels)) %>% as.numeric(),
+    rely_experts_too_much = ordered(Q_pop9, levels=pop_levels) %>% as.numeric(),
+    experts_claim = ordered(Q_pop10, levels=pop_levels) %>% as.numeric(),
+    unfair_system = ordered(Q_pop11, levels=pop_levels) %>% as.numeric(),
+    
+    article_perceived_tone = ordered(Q_manip_agree, levels=rev(c('Very positive', 'Somewhat positive', 'Neither', 'Somewhat negative', 'Very negative'))) %>% as.numeric,
+    article_realism = ordered(Q65, levels=c('Very unrealistic', 'Somewhat unrealistic', 'Neither', 'Somewhat realistic', 'Very realistic')) %>% as.numeric,
+    topic = case_when(
+      topic == 1 ~ 'jobs',
+      topic == 2 ~ 'inflation',
+      topic == 3 ~ 'general',
+    )
+)
+
+```
+
+# Results
+
+## Article Tone Manipulation Check
+
+```{r}
+
+etable(
+  feols(article_perceived_tone ~ tone + topic, data=df),
+  feols(article_perceived_tone ~ tone * topic, data=df),
+  digits=2
+)
+
+df %>% group_by(tone, topic) %>% summarize(m=mean(article_perceived_tone)) %>% ggplot(aes(x=tone, color=topic, y=m)) + geom_point() + geom_line() + theme_bw()
+ggsave(imgdir('p3manipcheck'), width=4, height=3)
+# Ok - average tone was 1.9 (negative) to 4.5 (positive)
+# Maybe the negative article could be toned more negative
+# Jobs and inflation positive articles were a bit lower contrast
+```
+
+## Realism
+
+```{r}
+df$research_fake = ifelse(is.na(df$Q66), NA, str_detect(df$Q66, 'research team made it up'))
+df$experts_dont_understand = ifelse(is.na(df$Q66), NA, str_detect(df$Q66, 'understand the economy'))
+etable(
+  feols(article_perceived_tone ~ tone * topic, data=df),
+  feols(article_realism ~ tone * topic, data=df),
+  feols(research_fake ~ tone * topic, data=df),
+  feols(experts_dont_understand ~ tone * topic, data=df),
+  digits=2
+)
+df %>% group_by(tone, topic) %>% summarize(m=mean(article_realism, na.rm=T), sd=sd(article_realism, na.rm=T)) %>% ggplot(aes(x=tone, color=topic, y=m)) + geom_point() + geom_line() + theme_bw() + labs(y='Article Realism')
+
+df %>% group_by(topic) %>% summarize(mean(str_detect(Q66, 'research team made it up'), na.rm=T))
+df %>% group_by(topic, tone) %>% summarize(sum(str_detect(Q66, 'research team made it up'), na.rm=T))
+df %>% group_by(topic, tone) %>% summarize(mean(str_detect(Q66, 'research team made it up'), na.rm=T))
+# Positive jobs article is regarded as the least suspicious. But overall incidence of fake article is very low.
+```
+Overall realism was actually quite good (4.2)
+Positive articles were rated as 0.9 scale points less realistic on average
+No major major heterogeneity although if you squint you could argue that the positive inflation story was rated the least realistic.
+
+When it came to explaining why the respondents thought the article was unrealistic, the original (positive) article was perceived as the most "made up by the research team" (although this is not super statsig). The positive jobs article was regarded as not made up by the research time. The mean incidence of participants saying the article was made up by the research team was very low on average, although it was as high as 12\% for the positive general article.
+
+Reassuringly, respondents were more likely to rate the positive articles as unrealistic because experts dont understand the economy.
+
+
+## Econ Perceptions and Article Trust 
+
+```{r}
+
+etable(
+  feols(econ_post ~ tone + topic + econ_pre, data=df),
+  feols(Q_second_order_1 ~ tone + topic  + econ_pre, data=df),
+  feols(article_trust ~ tone + topic  + econ_pre, data=df),
+  digits=2
+)
+etable(
+  feols(econ_post ~ tone * topic + econ_pre, data=df),
+  feols(Q_second_order_1 ~ tone * topic  + econ_pre, data=df),
+  feols(article_trust ~ tone * topic  + econ_pre, data=df),
+  digits=2
+)
+```
+
+Manipulation check works on econ post and article trust. No major heterogeneity by topic which is good. 
+
+Econ post patterns are consistent with before. The positive articles increased perceptions of the economy without major topic heterogeneity.
+Effect for second order are quite imprecise. Likert better? Unclear if this question is good as is.
+Article trust mirrors the realism answers but the size of the effects are more reasonable than before.
+
+# CONCLUSIONS
+
+The new articles behaved quite well in our test overall
+They consistently were perceived as more positive than the negative articles. The jobs article was perceived as the least positive, which I think makes sense based on the language used. However, this difference was small.
+
+Articles were generally rated as realistic and trustworthy. The positive articles were rated as less realistic/trustworthy across the board, although participants were more likely to claim this was because experts/politicians/journalists did not understand the economy than that the research team made up the article.
+
+However, to minimize suspicions that the article is fake, either the inflation or jobs article may be better to use in the next pilot. 
+
+
