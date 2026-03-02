@@ -1,0 +1,1426 @@
+---
+title: "Preregistered Analysis — Full Study"
+output: pdf_document
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{dcolumn}
+---
+
+```{r setup, echo=F, message=F, warning=F}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+pacman::p_load(tidyverse, here, stringr, psych)
+pacman::p_load(fixest, estimatr, marginaleffects, patchwork, modelsummary, knitr)
+
+pop_levels <- c('Strongly Disagree', 'Somewhat Disagree', 'Neither', 'Somewhat Agree', 'Strongly Agree')
+
+# econ_pre and econ_post use different capitalization in the QSF
+econ_pre_levels      <- c('Much worse', 'Somewhat worse', 'About the same', 'Somewhat better', 'Much better')
+econ_post_levels     <- c('Much Worse', 'Somewhat Worse', 'About the Same', 'Somewhat Better', 'Much Better')
+econ_identity_levels <- c('Extremely bad', 'Somewhat bad', 'Neither good nor bad', 'Somewhat good', 'Extremely good')
+econ2_levels <- c('The economy is getting much worse', 'The economy is getting somewhat worse',
+                  'The economy is neither getting better or worse',
+                  'The economy is getting somewhat better', 'The economy is getting much better')
+tone_levels  <- c('Extremely negative', 'Somewhat negative', 'Neither positive nor negative',
+                  'Somewhat positive', 'Extremely positive')
+
+data_file <- here('experiment/data/populism and news - FINAL_March 1, 2026_11.14.csv')
+full_cols  <- names(read_csv(data_file, n_max = 0, show_col_types = FALSE))
+df <- read_csv(data_file, skip = 3, col_names = full_cols, show_col_types = FALSE) %>%
+  mutate(
+    duration = as.numeric(`Duration (in seconds)`),
+    group    = as.character(group),
+
+    comment_neg_tone = group %in% c('1', '3'),
+    article_pos_tone = group %in% c('1', '2'),
+
+    att = case_when(
+      Q_att2 != 'Somewhat disagree'                    ~ 'Failed attention check',
+      !is.na(Q_socmed_bc) & Q_socmed_bc != ''          ~ 'Bot',
+      duration < 180                                    ~ 'Speeder',
+      TRUE                                              ~ 'N/A'
+    ),
+
+    econ_pre      = ordered(Q_econ_pre,      levels = econ_pre_levels)      %>% as.numeric(),
+    econ_post     = ordered(Q_econ_post,     levels = econ_post_levels)     %>% as.numeric(),
+    econ_identity = ordered(Q_econ_identity, levels = econ_identity_levels) %>% as.numeric(),
+
+    manip_art_tone = ordered(Q_manip_tone_1, levels = tone_levels) %>% as.numeric(),
+    manip_com_tone = ordered(Q_manip_tone_2, levels = tone_levels) %>% as.numeric(),
+
+    will_of_ppl      = ordered(Q_will_of_ppl,      levels = pop_levels)      %>% as.numeric(),
+    good_corrupt     = ordered(Q_good_corrupt,      levels = pop_levels)      %>% as.numeric(),
+    leader_represent = ordered(Q_leader_represent,  levels = pop_levels)      %>% as.numeric(),
+    system_stacked   = ordered(Q_system_stacked,    levels = pop_levels)      %>% as.numeric(),
+
+    public_officials_rev = ordered(Q_public_officials, levels = rev(pop_levels)) %>% as.numeric(),
+    econ_reality_rev     = ordered(Q_econ_reality,     levels = rev(pop_levels)) %>% as.numeric(),
+
+    experts_claim     = ordered(Q_experts_claim, levels = pop_levels)           %>% as.numeric(),
+    trust_experts_rev = ordered(Q_trust_experts, levels = rev(pop_levels))      %>% as.numeric(),
+    news_trust_rev    = ordered(Q_news_trust,
+                                levels = rev(c('Strongly Disagree', 'Somewhat Disagree', 'Neither',
+                                               'Somewhat Agree', 'Strongly Agree')))  %>% as.numeric(),
+
+    so_media   = ordered(Q_second_order_1, levels = econ2_levels) %>% as.numeric(),
+    so_experts = ordered(Q_second_order_2, levels = econ2_levels) %>% as.numeric(),
+    so_pols    = ordered(Q_second_order_3, levels = econ2_levels) %>% as.numeric(),
+    so_citizen = ordered(Q_second_order_4, levels = econ2_levels) %>% as.numeric(),
+
+    article_trust = ordered(Q_article_trust,
+                            levels = c("Don't trust at all", "Trust very little", "Trust a little",
+                                       "Trust a moderate amount", "Trust a great deal")) %>% as.numeric(),
+
+    # Pre-treatment items: Q_pop_pre_1-5 in QSF = pop_pre2-6 in PAP naming convention
+    pop_pre2 = ordered(Q_pop_pre_1, levels = pop_levels)      %>% as.numeric(), # will of the people
+    pop_pre3 = ordered(Q_pop_pre_2, levels = pop_levels)      %>% as.numeric(), # system stacked
+    pop_pre4 = ordered(Q_pop_pre_3, levels = rev(pop_levels)) %>% as.numeric(), # public officials (rev)
+    pop_pre5 = ordered(Q_pop_pre_4, levels = rev(pop_levels)) %>% as.numeric(), # news media (rev)
+    pop_pre6 = ordered(Q_pop_pre_5, levels = rev(pop_levels)) %>% as.numeric(), # trust experts (rev)
+
+    newsint = ordered(Q_newsint,
+                      levels = c('Hardly at all', 'Only now and then',
+                                 'Some of the time', 'Most of the time')) %>% as.numeric(),
+
+    # Party ID from survey Q_pid5 (5-point leaning scale → 3 dummies)
+    pid_democrat    = Q_pid5 %in% c('Strongly Lean Democrat',   'Slightly Lean Democrat'),
+    pid_republican  = Q_pid5 %in% c('Strongly Lean Republican', 'Slightly Lean Republican'),
+    pid_independent = Q_pid5 == 'Neither',
+  ) %>%
+  filter(!is.na(Q_manip_tone_1), group %in% as.character(1:4))
+
+# Prolific demographics join
+demo_file <- here('experiment/data/prolific_demographics_clean.rds')
+demo      <- readRDS(demo_file)
+df <- df %>%
+  left_join(demo, by = c('PROLIFIC_PID' = 'participant_id')) %>%
+  mutate(
+    education_yrs = case_when(
+      education == 'No formal qualifications'               ~  8,
+      education == 'Secondary education (e.g. GED/GCSE)'   ~ 10,
+      education == 'High school diploma/A-levels'           ~ 12,
+      education == 'Technical/community college'            ~ 14,
+      education == 'Undergraduate degree (BA/BSc/other)'    ~ 16,
+      education == 'Graduate degree (MA/MSc/MPhil/other)'   ~ 18,
+      education == 'Doctorate degree (PhD/other)'           ~ 20,
+    ),
+    faminc_num     = str_extract(faminc, "\\d[\\d,]*") %>% str_remove_all(',') %>% as.numeric(),
+    faminc_missing = is.na(faminc_num),
+    faminc_num     = if_else(faminc_missing, median(faminc_num, na.rm = TRUE), faminc_num),
+    faminc_num_log = log(faminc_num),
+  )
+
+# Composite indices — unweighted additive average, standardized to mean 0 SD 1
+df$disconnect <- scale(rowMeans(cbind(
+  df$will_of_ppl, df$good_corrupt, df$leader_represent,
+  df$public_officials_rev, df$econ_reality_rev, df$system_stacked
+), na.rm = TRUE))[, 1]
+
+# Sub-indices of disconnect
+# People-centric populism: normative pro-people attitudes
+df$populism_sub <- scale(rowMeans(cbind(
+  df$will_of_ppl, df$good_corrupt, df$leader_represent
+), na.rm = TRUE))[, 1]
+
+# Perceived elite unresponsiveness: beliefs about responsiveness failures
+df$elite_resp <- scale(rowMeans(cbind(
+  df$system_stacked, df$public_officials_rev, df$econ_reality_rev
+), na.rm = TRUE))[, 1]
+
+df$epistemic_distrust <- scale(rowMeans(cbind(
+  df$experts_claim, df$trust_experts_rev, df$news_trust_rev
+), na.rm = TRUE))[, 1]
+
+df$so_elite_avg <- (df$so_media + df$so_experts + df$so_pols) / 3
+
+# Scaled moderators
+df$econ_pre_z      <- scale(df$econ_pre)[, 1]
+df$econ_identity_z <- scale(df$econ_identity)[, 1]
+df$education_z <- scale(df$education_yrs)[, 1]
+df$faminc_z    <- scale(df$faminc_num_log)[, 1]
+
+# Preregistered control specification (Spec 1)
+controls <- ~ econ_identity + econ_pre + pop_pre2 + pop_pre3 + pop_pre4 + pop_pre5 + pop_pre6 +
+              newsint + pid_democrat + pid_republican + education_yrs + faminc_num_log
+
+# Attention-passing sample
+df.att <- df %>% filter(att == 'N/A') %>%
+  mutate(article_topic = if_else(articleTopic == 1, "General", "Jobs"))
+df.pos <- df.att %>% filter(article_pos_tone == TRUE)
+df.neu <- df.att %>% filter(comment_neg_tone == FALSE)
+
+# Stimulus-specific subsamples — for robustness
+df.att.gen <- df.att %>% filter(article_topic == "General")
+df.att.job <- df.att %>% filter(article_topic == "Jobs")
+df.neu.gen <- df.neu %>% filter(article_topic == "General")
+df.neu.job <- df.neu %>% filter(article_topic == "Jobs")
+
+# Full sample (no exclusions) — for robustness
+df.full     <- df
+df.full.pos <- df.full %>% filter(article_pos_tone == TRUE)
+df.full.neu <- df.full %>% filter(comment_neg_tone == FALSE)
+
+# ── Helper: marginal-effects slope plots ──────────────────────────────────────
+slope_plot_mod <- function(model, var, mod_var, mod_label, title, ylab) {
+  int_term <- paste0(var, "TRUE:", mod_var)
+  b  <- coef(model)[int_term]
+  se <- sqrt(diag(vcov(model)))[int_term]
+  sub <- sprintf("b = %.3f (SE %.3f)", b, se)
+  slopes(model, variables = var,
+         newdata = do.call(datagrid,
+                           c(list(model = model),
+                             setNames(list(seq(-2, 2, by = 0.25)), mod_var)))) %>%
+    ggplot(aes(x = .data[[mod_var]], y = estimate, ymin = conf.low, ymax = conf.high)) +
+    geom_ribbon(alpha = 0.15) + geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    labs(title = title, subtitle = sub, x = mod_label, y = ylab) +
+    theme_bw(base_size = 9)
+}
+
+slope_plot <- function(model, var, title, ylab) {
+  int_term <- paste0(var, "TRUE:econ_pre_z")
+  b  <- coef(model)[int_term]
+  se <- sqrt(diag(vcov(model)))[int_term]
+  sub <- sprintf("b = %.3f (SE %.3f)", b, se)
+  slopes(model, variables = var,
+         newdata = datagrid(econ_pre_z = seq(-2, 2, by = 0.25))) %>%
+    ggplot(aes(x = econ_pre_z, y = estimate, ymin = conf.low, ymax = conf.high)) +
+    geom_ribbon(alpha = 0.15) + geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    labs(title = title, subtitle = sub,
+         x = "econ_pre (z, higher = optimistic)", y = ylab) +
+    theme_bw(base_size = 9)
+}
+
+# ── Output directories and study tag ──────────────────────────────────────────
+# Change study_tag to switch all output filenames at once (e.g. "full" for full study)
+study_tag <- "pilot4"
+
+tables_dir  <- here('experiment/tables')
+figures_dir <- here('figures')
+dir.create(tables_dir,  showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+
+# ── Helper: overlaid slope comparison (2-way: treatment × econ_pre) ──────────
+slope_compare <- function(m1, m2, var, title, ylab,
+                          label1 = "Adjusted", label2 = "Unadjusted") {
+  get_sl <- function(m, spec)
+    slopes(m, variables = var,
+           newdata = datagrid(econ_pre_z = seq(-2, 2, by = 0.25))) %>%
+    mutate(spec = spec)
+  bind_rows(get_sl(m1, label1), get_sl(m2, label2)) %>%
+    mutate(spec = factor(spec, levels = c(label1, label2))) %>%
+    ggplot(aes(x = econ_pre_z, y = estimate, ymin = conf.low, ymax = conf.high,
+               colour = spec, fill = spec, linetype = spec)) +
+    geom_ribbon(alpha = 0.10, colour = NA) +
+    geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    scale_colour_manual(values   = setNames(c("#333333", "#999999"), c(label1, label2))) +
+    scale_fill_manual(  values   = setNames(c("#333333", "#999999"), c(label1, label2))) +
+    scale_linetype_manual(values = setNames(c("solid",   "dashed"),  c(label1, label2))) +
+    labs(title = title, x = "econ_pre (z, higher = optimistic)", y = ylab,
+         colour = NULL, fill = NULL, linetype = NULL) +
+    theme_bw(base_size = 9) + theme(legend.position = "top")
+}
+
+# ── Helper: overlaid triple slope comparison (comment × article × econ_pre) ───
+triple_slope_compare <- function(m1, m2, outcome_label,
+                                 label1 = "Adjusted", label2 = "Unadjusted") {
+  get_sl <- function(m, spec)
+    slopes(m, variables = "comment_neg_tone",
+           newdata = datagrid(econ_pre_z       = seq(-2, 2, by = 0.25),
+                              article_pos_tone = c(TRUE, FALSE))) %>%
+    mutate(spec    = spec,
+           article = if_else(article_pos_tone, "Positive article", "Negative article"))
+  bind_rows(get_sl(m1, label1), get_sl(m2, label2)) %>%
+    mutate(spec = factor(spec, levels = c(label1, label2))) %>%
+    ggplot(aes(x = econ_pre_z, y = estimate, ymin = conf.low, ymax = conf.high,
+               colour = article, fill = article, linetype = spec)) +
+    geom_ribbon(alpha = 0.08, colour = NA) +
+    geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    scale_colour_manual(values = c("Positive article" = "#2166AC", "Negative article" = "#E41A1C")) +
+    scale_fill_manual(  values = c("Positive article" = "#2166AC", "Negative article" = "#E41A1C")) +
+    scale_linetype_manual(values = setNames(c("solid", "dashed"), c(label1, label2))) +
+    guides(fill = "none") +
+    labs(title = outcome_label, x = "econ_pre (z, higher = optimistic)",
+         y = "AME of neg. comments", colour = NULL, linetype = NULL) +
+    theme_bw(base_size = 9) + theme(legend.position = "top")
+}
+
+# ── Helper: triple interaction slope plot (comment × article × moderator) ─────
+triple_slope_plot <- function(model, outcome_label) {
+  int_term <- "comment_neg_toneTRUE:article_pos_toneTRUE:econ_pre_z"
+  b  <- coef(model)[int_term]
+  se <- sqrt(diag(vcov(model)))[int_term]
+  sub <- sprintf("3-way b = %.3f (SE %.3f)", b, se)
+  slopes(model, variables = "comment_neg_tone",
+         newdata = datagrid(econ_pre_z       = seq(-2, 2, by = 0.25),
+                            article_pos_tone = c(TRUE, FALSE))) %>%
+    mutate(article = if_else(article_pos_tone, "Positive article", "Negative article")) %>%
+    ggplot(aes(x = econ_pre_z, y = estimate, ymin = conf.low, ymax = conf.high,
+               colour = article, fill = article)) +
+    geom_ribbon(alpha = 0.12, colour = NA) +
+    geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    scale_colour_manual(values = c("Positive article" = "#2166AC", "Negative article" = "#E41A1C")) +
+    scale_fill_manual(  values = c("Positive article" = "#2166AC", "Negative article" = "#E41A1C")) +
+    labs(title = outcome_label, subtitle = sub,
+         x = "econ_pre (z, higher = optimistic)",
+         y = "AME of neg. comments", colour = NULL, fill = NULL) +
+    theme_bw(base_size = 9) +
+    theme(legend.position = "top")
+}
+
+# Helpers
+save_fig <- function(name, ...) {
+  ggsave(file.path(figures_dir, paste0(name, ".", study_tag, ".png")), ...)
+}
+
+save_etable <- function(..., filename, headers = NULL, keep = NULL, digits = 2) {
+  args <- list(..., digits = digits, tex = TRUE)
+  if (!is.null(keep)) args$keep <- keep
+  # Write to file via capture to avoid fixest file= bug in v0.12.1
+  tex_out <- do.call(etable, args)
+  writeLines(tex_out, file.path(tables_dir, filename))
+  invisible(tex_out)
+}
+```
+
+# Sample
+
+```{r, echo=F}
+cat("Total responses loaded:", nrow(df %>% filter(group != 5)), "\n")
+cat("Attention check failures:", sum((df %>% filter(group != 5))$att == 'Failed attention check', na.rm=T), "\n")
+cat("Speeders:", sum((df %>% filter(group != 5))$att == 'Speeder', na.rm=T), "\n")
+cat("Passing attention (df.att):", nrow(df.att), "\n\n")
+
+df.att %>% count(group, article_pos_tone, comment_neg_tone) %>%
+  kable(caption = "Cell sizes (attention-passing sample)")
+
+df.att %>% count(group, article_pos_tone, comment_neg_tone, articleTopic) %>%
+  kable(caption = "Cell sizes (attention-passing sample)")
+```
+
+# Descriptives
+
+```{r descriptives, echo=F}
+# Continuous: age
+age_sum <- df.att %>%
+  summarise(N = sum(!is.na(age)), Mean = mean(age, na.rm=T), SD = sd(age, na.rm=T),
+            Min = min(age, na.rm=T), Max = max(age, na.rm=T)) %>%
+  mutate(across(where(is.numeric), ~round(., 1)))
+kable(age_sum, caption = "Age")
+
+# Economic pessimism (primary moderator)
+df.att %>%
+  mutate(econ_pre_label = factor(Q_econ_pre, levels = econ_pre_levels)) %>%
+  count(econ_pre_label) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(caption = "Economic conditions pre-treatment (econ_pre)")
+
+# Education
+df.att %>%
+  mutate(education = factor(education,
+    levels = c('No formal qualifications', 'Secondary education (e.g. GED/GCSE)',
+               'High school diploma/A-levels', 'Technical/community college',
+               'Undergraduate degree (BA/BSc/other)', 'Graduate degree (MA/MSc/MPhil/other)',
+               'Doctorate degree (PhD/other)'))) %>%
+  count(education) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(caption = "Education")
+
+# Party ID (from survey)
+df.att %>%
+  count(Q_pid5) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n)) %>%
+  kable(caption = "Party ID (survey Q_pid5)")
+
+# Household income
+df.att %>%
+  filter(!is.na(faminc), faminc != 'CONSENT_REVOKED') %>%
+  mutate(faminc = factor(faminc, levels = c(
+    'Less than $10000', '$10000–$15999', '$16000–$19999', '$20000–$29999',
+    '$30000–$39999', '$40000–$49999', '$50000–$59999', '$60000–$69999',
+    '$70000–$79999', '$80000–$89999', '$90000–$99999',
+    '$100000–$149999', 'More than $150000'))) %>%
+  count(faminc) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(caption = "Household income (Prolific)")
+```
+
+---
+
+# Manipulation Checks
+
+## Perceived tone
+
+```{r, echo=F, fig.height=2.5, fig.width=6}
+m_manip_art <- feols(manip_art_tone ~ article_pos_tone + .[controls], data = df.att)
+m_manip_com <- feols(manip_com_tone ~ comment_neg_tone + .[controls], data = df.att)
+
+manip_coef_df <- bind_rows(
+  tibble(outcome  = "Article tone perception",
+         estimate = coef(m_manip_art)["article_pos_toneTRUE"],
+         lo       = confint(m_manip_art)["article_pos_toneTRUE", 1],
+         hi       = confint(m_manip_art)["article_pos_toneTRUE", 2]),
+  tibble(outcome  = "Comment tone perception",
+         estimate = coef(m_manip_com)["comment_neg_toneTRUE"],
+         lo       = confint(m_manip_com)["comment_neg_toneTRUE", 1],
+         hi       = confint(m_manip_com)["comment_neg_toneTRUE", 2])
+)
+
+ggplot(manip_coef_df, aes(y = outcome, x = estimate, xmin = lo, xmax = hi)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(linewidth = 0.5, size = 0.4) +
+  labs(x = "Coefficient (95% CI)", y = NULL,
+       title = "Manipulation checks: perceived tone") +
+  theme_bw(base_size = 9)
+save_fig("manip.tone")
+```
+
+## Article trust
+
+Positive article should be trusted less overall, and especially by economically dissatisfied respondents (H1 manipulation check). Higher values = more trust.
+
+```{r manip_trust, echo=F, fig.height=3.5, fig.width=9}
+m_trust_main <- feols(article_trust ~ article_pos_tone + comment_neg_tone + .[controls], data = df.att)
+m_trust_het  <- feols(article_trust ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.att)
+
+p_trust1 <- ggplot(
+  tibble(term    = c("Pos. article", "Neg. comment"),
+         estimate = c(coef(m_trust_main)["article_pos_toneTRUE"],
+                      coef(m_trust_main)["comment_neg_toneTRUE"]),
+         lo      = c(confint(m_trust_main)["article_pos_toneTRUE", 1],
+                     confint(m_trust_main)["comment_neg_toneTRUE", 1]),
+         hi      = c(confint(m_trust_main)["article_pos_toneTRUE", 2],
+                     confint(m_trust_main)["comment_neg_toneTRUE", 2])),
+  aes(y = term, x = estimate, xmin = lo, xmax = hi)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(linewidth = 0.5, size = 0.4) +
+  labs(x = "Coefficient (95% CI)", y = NULL, title = "Article trust: main effects") +
+  theme_bw(base_size = 9)
+
+p_trust2 <- slope_plot(m_trust_het, "article_pos_tone",
+                       "Article trust × econ_pre", "AME of pos. article")
+
+p_trust1 + p_trust2 +
+  plot_annotation(title = "Manipulation check: article trust",
+                  subtitle = "Higher = more trust; expect negative article_pos_tone effect, steeper for pessimists")
+save_fig("manip.article.trust", height = 3.5, width = 9)
+```
+
+```{r manip_trust_table, results='asis', echo=F, eval=FALSE}
+save_etable(m_trust_main, m_trust_het,
+  filename = "manip_article_trust.tex",
+  headers  = c("Main effects", "× econ\\_pre"))
+```
+
+## Second-order beliefs (H1 first stage)
+
+```{r, echo=F, fig.height=4, fig.width=7.5}
+m_econ_post  <- feols(econ_post  ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+m_so_media   <- feols(so_media   ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+m_so_experts <- feols(so_experts ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+m_so_pols    <- feols(so_pols    ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+m_so_citizen <- feols(so_citizen ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+
+trms_mc <- c("comment_neg_toneTRUE", "article_pos_toneTRUE",
+             "comment_neg_toneTRUE:article_pos_toneTRUE")
+
+mc_extract <- function(m, outcome, family) {
+  e  <- coef(m)[trms_mc]
+  ci <- confint(m)[trms_mc, , drop = FALSE]
+  tibble(term = names(e), estimate = e, lo = ci[, 1], hi = ci[, 2],
+         outcome = outcome, family = family)
+}
+
+econ_df <- bind_rows(
+  mc_extract(m_econ_post,  "econ_post",  "Economic perceptions"),
+  mc_extract(m_so_media,   "so_media",   "Second-order beliefs"),
+  mc_extract(m_so_experts, "so_experts", "Second-order beliefs"),
+  mc_extract(m_so_pols,    "so_pols",    "Second-order beliefs"),
+  mc_extract(m_so_citizen, "so_citizen", "Second-order beliefs"),
+) %>% mutate(
+  treatment = recode(term,
+    "comment_neg_toneTRUE"                      = "Neg. comment",
+    "article_pos_toneTRUE"                      = "Pos. article",
+    "comment_neg_toneTRUE:article_pos_toneTRUE" = "Interaction"),
+  outcome = factor(outcome, levels = rev(c("econ_post", "so_media", "so_experts", "so_pols", "so_citizen"))),
+  family  = factor(family, levels = c("Economic perceptions", "Second-order beliefs"))
+)
+
+ggplot(econ_df, aes(y = outcome, x = estimate, xmin = lo, xmax = hi, colour = treatment)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.55), linewidth = 0.5, size = 0.35) +
+  facet_grid(family ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = c(
+    "Neg. comment" = "#E41A1C", "Pos. article" = "#2166AC", "Interaction" = "#5E4FA2")) +
+  labs(x = "Coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "Manipulation check: economic perceptions and second-order beliefs") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "top",
+        strip.text.y = element_text(size = 7, angle = 0),
+        panel.grid.major.y = element_blank())
+save_fig("manip.so", height = 5)
+```
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_so_media, m_so_experts, m_so_pols, m_so_citizen,
+  filename = "manip_so.tex",
+  headers = c("so\\_media", "so\\_experts", "so\\_pols", "so\\_citizen"),
+  keep = c('tone')
+)
+```
+
+---
+
+# H1: Article Backlash (H1a — disconnect, H1b — epistemic distrust)
+
+Estimated within the **neutral-comments arm**. Coefficient of interest: `article_pos_tone × econ_pre_z` (negative = pessimists show larger effects).
+
+```{r h1, echo=F, fig.height=4, fig.width=10}
+m_h1_disc  <- feols(disconnect         ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu)
+m_h1_epist <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu)
+
+p_h1_disc  <- slope_plot(m_h1_disc,  "article_pos_tone", "H1a: disconnect",         "AME of pos. article")
+p_h1_epist <- slope_plot(m_h1_epist, "article_pos_tone", "H1b: epistemic distrust", "AME of pos. article")
+
+p_h1_disc + p_h1_epist +
+  plot_annotation(title = "H1: Effect of positive article by economic pessimism (neutral-comments arm)",
+                  subtitle = "econ_pre as proxy for econ_identity (pilot)")
+save_fig("h1.backlash")
+```
+
+```{r h1_table, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_h1_disc, m_h1_epist,
+  filename = "h1_backlash.tex",
+  headers = c("H1a: disconnect", "H1b: epist.\\ distrust")
+)
+```
+
+## H1 Robustness: IV/CACE via SO Belief Updating
+
+2SLS using article assignment as an instrument for SO belief updating (`so_elite_avg`). Estimates the effect of the article's elite-optimism signal on outcomes among respondents who actually processed it. Exclusion restriction: article tone affects disconnect only through SO belief updating, not through direct personal economic assessment. Estimated in the neutral-comments arm only.
+
+```{r cace, echo=F}
+# Construct IV formulas programmatically from the controls object
+ctrl_vars <- labels(terms(controls))
+ctrl_str  <- paste(ctrl_vars, collapse = " + ")
+
+iv_formula_disc  <- as.formula(paste("disconnect ~",         ctrl_str, "| so_elite_avg ~ article_pos_tone"))
+iv_formula_epist <- as.formula(paste("epistemic_distrust ~", ctrl_str, "| so_elite_avg ~ article_pos_tone"))
+
+m_iv_disc  <- feols(iv_formula_disc,  data = df.neu)
+m_iv_epist <- feols(iv_formula_epist, data = df.neu)
+
+# First stage
+fs_formula <- as.formula(paste("so_elite_avg ~ article_pos_tone +", ctrl_str))
+m_first_stage <- feols(fs_formula, data = df.neu)
+
+cat("First stage — article_pos_tone → so_elite_avg\n")
+cat(sprintf("  b = %.3f, SE = %.3f, t = %.2f\n",
+            coef(m_first_stage)["article_pos_toneTRUE"],
+            se(m_first_stage)["article_pos_toneTRUE"],
+            coef(m_first_stage)["article_pos_toneTRUE"] / se(m_first_stage)["article_pos_toneTRUE"]))
+cat(sprintf("  F-statistic (instrument): %.1f\n",
+            fitstat(m_iv_disc, "ivf")[[1]]$stat))
+
+cat("\n2SLS — effect of so_elite_avg on outcomes (instrumented by article assignment)\n")
+cat(sprintf("  Disconnect:         b = %.3f, SE = %.3f\n",
+            coef(m_iv_disc)["fit_so_elite_avg"],  se(m_iv_disc)["fit_so_elite_avg"]))
+cat(sprintf("  Epistemic distrust: b = %.3f, SE = %.3f\n",
+            coef(m_iv_epist)["fit_so_elite_avg"], se(m_iv_epist)["fit_so_elite_avg"]))
+```
+
+```{r cace_table, results='asis', echo=F, eval=FALSE}
+# OLS comparison: reduced-form ITT (article → outcome, neutral arm, no moderator)
+m_ols_disc  <- feols(disconnect         ~ article_pos_tone + .[controls], data = df.neu)
+m_ols_epist <- feols(epistemic_distrust ~ article_pos_tone + .[controls], data = df.neu)
+
+save_etable(
+  m_ols_disc, m_iv_disc, m_ols_epist, m_iv_epist,
+  filename = "cace_iv.tex",
+  headers  = c("OLS disc", "2SLS disc", "OLS epist", "2SLS epist"),
+  keep     = c("article_pos_tone", "so_elite_avg", "fit_so_elite_avg")
+)
+```
+
+---
+
+# H2: Mismatch Interaction (H2a — disconnect, H2b — epistemic distrust)
+
+Estimated across the **full 2×2 sample**. Coefficient of interest: `comment_neg_tone × article_pos_tone` (positive = comment effects larger in positive-article context).
+
+```{r h2, echo=F, fig.height=3.5, fig.width=6}
+m_h2_disc  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+m_h2_epist <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att)
+
+int_term <- "comment_neg_toneTRUE:article_pos_toneTRUE"
+
+h2_df <- bind_rows(
+  tibble(outcome = "disconnect (index)",         family = "Main Indices", index = TRUE,
+         estimate = coef(m_h2_disc)[int_term],
+         lo = confint(m_h2_disc)[int_term, 1], hi = confint(m_h2_disc)[int_term, 2]),
+  tibble(outcome = "epistemic_distrust (index)", family = "Main Indices", index = TRUE,
+         estimate = coef(m_h2_epist)[int_term],
+         lo = confint(m_h2_epist)[int_term, 1], hi = confint(m_h2_epist)[int_term, 2]),
+) %>% mutate(
+  outcome = factor(outcome, levels = rev(c("disconnect (index)", "epistemic_distrust (index)")))
+)
+
+fmt_pv <- function(pv) ifelse(pv < 0.001, "< 0.001", sprintf("%.3f", pv))
+stars   <- function(pv) ifelse(pv < 0.001, "***", ifelse(pv < 0.01, "**", ifelse(pv < 0.05, "*", ifelse(pv < 0.1, "†", ""))))
+
+tibble(
+  Outcome = c("Disconnect", "Epistemic distrust"),
+  `b`     = round(c(coef(m_h2_disc)[int_term], coef(m_h2_epist)[int_term]), 3),
+  `95% CI` = c(sprintf("[%.3f, %.3f]", confint(m_h2_disc)[int_term,1],  confint(m_h2_disc)[int_term,2]),
+               sprintf("[%.3f, %.3f]", confint(m_h2_epist)[int_term,1], confint(m_h2_epist)[int_term,2])),
+  `p`     = c(fmt_pv(pvalue(m_h2_disc)[int_term]), fmt_pv(pvalue(m_h2_epist)[int_term])),
+  ` `     = c(stars(pvalue(m_h2_disc)[int_term]),  stars(pvalue(m_h2_epist)[int_term]))
+) %>% kable(align = "lrrrl")
+
+ggplot(h2_df, aes(y = outcome, x = estimate, xmin = lo, xmax = hi, shape = index)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(colour = "#5E4FA2", linewidth = 0.5, size = 0.5) +
+  scale_shape_manual(values = c("TRUE" = 18, "FALSE" = 16), guide = "none") +
+  labs(x = "Interaction coefficient (95% CI)", y = NULL,
+       title = "H2: Mismatch interaction (pos. article × neg. comment)") +
+  theme_bw(base_size = 9) +
+  theme(panel.grid.major.y = element_blank())
+save_fig("h2.mismatch")
+```
+
+```{r h2_table, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_h2_disc, m_h2_epist,
+  filename = "h2_mismatch.tex",
+  headers = c("H2a: disconnect", "H2b: epist.\\ distrust"),
+  keep = c('tone')
+)
+```
+
+---
+
+# RQ1: Mismatch Heterogeneity by Economic Satisfaction
+
+Estimated on the **full 2×2 sample** as a triple interaction. Coefficients of interest: `comment_neg_tone × econ_pre_z` slopes plotted separately for positive and negative article arms. The three-way term (`comment_neg_tone × article_pos_tone × econ_pre_z`) tests whether the comment-pessimism slope differs by article valence.
+
+```{r rq1, echo=F, fig.height=4, fig.width=8}
+m_rq1_disc  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att)
+m_rq1_epist <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att)
+
+p_rq1_disc  <- triple_slope_plot(m_rq1_disc,  "Disconnect")
+p_rq1_epist <- triple_slope_plot(m_rq1_epist, "Epistemic distrust")
+
+p_rq1_disc + p_rq1_epist +
+  plot_annotation(title = "RQ1: Comment effect by economic pessimism, by article valence")
+save_fig("rq1.het", height = 4, width = 8)
+```
+
+```{r rq1_table, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_rq1_disc, m_rq1_epist,
+  filename = "rq1_het.tex",
+  headers = c("disconnect", "epist.\\ distrust"),
+  keep = c('econ_pre_z', 'article_pos_tone')
+)
+```
+
+---
+
+# Robustness: Stimulus-Specific Effects
+
+All primary analyses replicated separately by article topic variant (general economic conditions vs. jobs-focused) to assess consistency across stimuli.
+
+## Manipulation checks by stimulus
+
+Article-side manipulation check outcomes (perceived tone, article trust, second-order beliefs) stratified by stimulus. Comment tone perception is omitted since comments are identical across stimuli.
+
+```{r manip_stim, echo=F, fig.height=4.5, fig.width=7}
+mc_stim_extract <- function(data, stimulus_label) {
+  m_tone  <- feols(manip_art_tone ~ article_pos_tone + .[controls], data = data)
+  m_trust <- feols(article_trust  ~ article_pos_tone + comment_neg_tone + .[controls], data = data)
+  m_so_med <- feols(so_media   ~ article_pos_tone + comment_neg_tone + .[controls], data = data)
+  m_so_exp <- feols(so_experts ~ article_pos_tone + comment_neg_tone + .[controls], data = data)
+  m_so_pol <- feols(so_pols    ~ article_pos_tone + comment_neg_tone + .[controls], data = data)
+  m_so_cit <- feols(so_citizen ~ article_pos_tone + comment_neg_tone + .[controls], data = data)
+
+  trm <- "article_pos_toneTRUE"
+  bind_rows(
+    tibble(outcome = "Perceived article tone", family = "Tone / Trust",
+           estimate = coef(m_tone)[trm],  lo = confint(m_tone)[trm,1],  hi = confint(m_tone)[trm,2]),
+    tibble(outcome = "Article trust",          family = "Tone / Trust",
+           estimate = coef(m_trust)[trm], lo = confint(m_trust)[trm,1], hi = confint(m_trust)[trm,2]),
+    tibble(outcome = "so_media",   family = "Second-order beliefs",
+           estimate = coef(m_so_med)[trm], lo = confint(m_so_med)[trm,1], hi = confint(m_so_med)[trm,2]),
+    tibble(outcome = "so_experts", family = "Second-order beliefs",
+           estimate = coef(m_so_exp)[trm], lo = confint(m_so_exp)[trm,1], hi = confint(m_so_exp)[trm,2]),
+    tibble(outcome = "so_pols",    family = "Second-order beliefs",
+           estimate = coef(m_so_pol)[trm], lo = confint(m_so_pol)[trm,1], hi = confint(m_so_pol)[trm,2]),
+    tibble(outcome = "so_citizen", family = "Second-order beliefs",
+           estimate = coef(m_so_cit)[trm], lo = confint(m_so_cit)[trm,1], hi = confint(m_so_cit)[trm,2])
+  ) %>% mutate(stimulus = stimulus_label)
+}
+
+manip_stim_df <- bind_rows(
+  mc_stim_extract(df.att.gen, "General economy"),
+  mc_stim_extract(df.att.job, "Jobs")
+) %>% mutate(
+  outcome  = factor(outcome, levels = rev(c("Perceived article tone", "Article trust",
+                                            "so_media", "so_experts", "so_pols", "so_citizen"))),
+  family   = factor(family,  levels = c("Tone / Trust", "Second-order beliefs")),
+  stimulus = factor(stimulus, levels = c("General economy", "Jobs"))
+)
+
+ggplot(manip_stim_df, aes(y = outcome, x = estimate, xmin = lo, xmax = hi, colour = stimulus)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.55), linewidth = 0.5, size = 0.35) +
+  facet_grid(family ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = c("General economy" = "#333333", "Jobs" = "#999999")) +
+  labs(x = "Effect of pos. article (95% CI)", y = NULL, colour = NULL,
+       title = "Manipulation checks: article effects by stimulus") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "top",
+        strip.text.y = element_text(size = 7, angle = 0),
+        panel.grid.major.y = element_blank())
+```
+
+## H1 by stimulus
+
+```{r h1_stim, echo=F, fig.height=3.5, fig.width=9}
+m_h1_disc_gen  <- feols(disconnect         ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu.gen)
+m_h1_epist_gen <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu.gen)
+m_h1_disc_job  <- feols(disconnect         ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu.job)
+m_h1_epist_job <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.neu.job)
+
+stim_slope_h1 <- function(m_gen, m_job, title, ylab) {
+  int_term <- "article_pos_toneTRUE:econ_pre_z"
+  fmt_stat <- function(m, label) {
+    b  <- coef(m)[int_term]
+    pv <- pvalue(m)[int_term]
+    stars <- ifelse(pv < 0.001, "***", ifelse(pv < 0.01, "**", ifelse(pv < 0.05, "*", ifelse(pv < 0.1, "†", ""))))
+    sprintf("%s: b = %.3f%s, p = %.3f", label, b, stars, pv)
+  }
+  sub <- paste(fmt_stat(m_gen, "General"), fmt_stat(m_job, "Jobs"), sep = "  |  ")
+  get_sl <- function(m, lbl)
+    slopes(m, variables = "article_pos_tone",
+           newdata = datagrid(econ_pre_z = seq(-2, 2, by = 0.25))) %>%
+    mutate(stimulus = lbl)
+  bind_rows(get_sl(m_gen, "General economy"), get_sl(m_job, "Jobs")) %>%
+    mutate(stimulus = factor(stimulus, levels = c("General economy", "Jobs"))) %>%
+    ggplot(aes(x = econ_pre_z, y = estimate, ymin = conf.low, ymax = conf.high,
+               colour = stimulus, fill = stimulus)) +
+    geom_ribbon(alpha = 0.12, colour = NA) +
+    geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    scale_colour_manual(values = c("General economy" = "#2166AC", "Jobs" = "#E41A1C")) +
+    scale_fill_manual(  values = c("General economy" = "#2166AC", "Jobs" = "#E41A1C")) +
+    labs(title = title, subtitle = sub,
+         x = "econ_pre (z, higher = optimistic)", y = ylab,
+         colour = NULL, fill = NULL) +
+    theme_bw(base_size = 9) + theme(legend.position = "top")
+}
+
+stim_slope_h1(m_h1_disc_gen,  m_h1_disc_job,  "H1a: disconnect",         "AME of pos. article") +
+stim_slope_h1(m_h1_epist_gen, m_h1_epist_job, "H1b: epistemic distrust", "AME of pos. article") +
+plot_annotation(title = "H1: Article backlash — general economy vs. jobs stimulus")
+```
+
+## H2 by stimulus
+
+```{r h2_stim, echo=F, fig.height=2.2, fig.width=5.5}
+m_h2_disc_gen  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att.gen)
+m_h2_epist_gen <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att.gen)
+m_h2_disc_job  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att.job)
+m_h2_epist_job <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone + .[controls], data = df.att.job)
+
+int_term <- "comment_neg_toneTRUE:article_pos_toneTRUE"
+
+h2_stim_df <- bind_rows(
+  tibble(outcome = "Epistemic distrust", stimulus = "General economy",
+         estimate = coef(m_h2_epist_gen)[int_term], lo = confint(m_h2_epist_gen)[int_term,1], hi = confint(m_h2_epist_gen)[int_term,2],
+         pv = pvalue(m_h2_epist_gen)[int_term]),
+  tibble(outcome = "Epistemic distrust", stimulus = "Jobs",
+         estimate = coef(m_h2_epist_job)[int_term], lo = confint(m_h2_epist_job)[int_term,1], hi = confint(m_h2_epist_job)[int_term,2],
+         pv = pvalue(m_h2_epist_job)[int_term]),
+  tibble(outcome = "Disconnect",         stimulus = "General economy",
+         estimate = coef(m_h2_disc_gen)[int_term],  lo = confint(m_h2_disc_gen)[int_term,1],  hi = confint(m_h2_disc_gen)[int_term,2],
+         pv = pvalue(m_h2_disc_gen)[int_term]),
+  tibble(outcome = "Disconnect",         stimulus = "Jobs",
+         estimate = coef(m_h2_disc_job)[int_term],  lo = confint(m_h2_disc_job)[int_term,1],  hi = confint(m_h2_disc_job)[int_term,2],
+         pv = pvalue(m_h2_disc_job)[int_term])
+) %>% mutate(outcome  = factor(outcome,  levels = c("Disconnect", "Epistemic distrust")),
+             stimulus = factor(stimulus, levels = c("General economy", "Jobs")))
+
+h2_stim_df %>%
+  mutate(b    = round(estimate, 3),
+         `95% CI` = sprintf("[%.3f, %.3f]", lo, hi),
+         p    = ifelse(pv < 0.001, "< 0.001", sprintf("%.3f", pv)),
+         ` `  = ifelse(pv < 0.001, "***", ifelse(pv < 0.01, "**", ifelse(pv < 0.05, "*", ifelse(pv < 0.1, "†", ""))))) %>%
+  select(Outcome = outcome, Stimulus = stimulus, b, `95% CI`, p, ` `) %>%
+  kable(align = "llrrrl")
+
+ggplot(h2_stim_df, aes(y = outcome, x = estimate, xmin = lo, xmax = hi, colour = stimulus)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.5), linewidth = 0.5, size = 0.45) +
+  scale_colour_manual(values = c("General economy" = "#333333", "Jobs" = "#999999")) +
+  labs(x = "Interaction coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "H2: Mismatch interaction — general economy vs. jobs stimulus") +
+  theme_bw(base_size = 9) + theme(legend.position = "top", panel.grid.major.y = element_blank())
+```
+
+## Stimulus heterogeneity test
+
+Formal test of whether the difference in effect sizes between the two stimuli is statistically significant. Each test is a triple interaction (hypothesis interaction $\times$ article\_topic). All results are ns, confirming that the apparent attenuation in the jobs article is statistically indistinguishable from sampling variance.
+
+```{r stim_heterogeneity, echo=F}
+m_h1b_triple <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z * article_topic +
+                        comment_neg_tone + .[controls], data = df.neu)
+m_h2b_triple <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * article_topic +
+                        .[controls], data = df.att)
+m_h1a_triple <- feols(disconnect ~ article_pos_tone * econ_pre_z * article_topic +
+                        comment_neg_tone + .[controls], data = df.neu)
+m_h2a_triple <- feols(disconnect ~ comment_neg_tone * article_pos_tone * article_topic +
+                        .[controls], data = df.att)
+
+fmt_triple <- function(m, term) {
+  b  <- coef(m)[term]
+  se <- sqrt(diag(vcov(m)))[term]
+  pv <- pvalue(m)[term]
+  stars <- ifelse(pv < 0.001, "***", ifelse(pv < 0.01, "**", ifelse(pv < 0.05, "*", ifelse(pv < 0.1, "†", ""))))
+  tibble(b = round(b, 3), SE = round(se, 3), p = round(pv, 3), ` ` = stars)
+}
+
+bind_rows(
+  fmt_triple(m_h1a_triple, "article_pos_toneTRUE:econ_pre_z:article_topicJobs") %>% mutate(Hypothesis = "H1a (disconnect)", .before = 1),
+  fmt_triple(m_h1b_triple, "article_pos_toneTRUE:econ_pre_z:article_topicJobs") %>% mutate(Hypothesis = "H1b (epistemic distrust)", .before = 1),
+  fmt_triple(m_h2a_triple, "comment_neg_toneTRUE:article_pos_toneTRUE:article_topicJobs") %>% mutate(Hypothesis = "H2a (disconnect)", .before = 1),
+  fmt_triple(m_h2b_triple, "comment_neg_toneTRUE:article_pos_toneTRUE:article_topicJobs") %>% mutate(Hypothesis = "H2b (epistemic distrust)", .before = 1)
+) %>%
+  kable(caption = "Triple interaction: hypothesis effect x article\\_topic (Jobs vs. General). Coefficient on the Jobs interaction term; negative = smaller effect for jobs article.")
+```
+
+## RQ1 by stimulus
+
+```{r rq1_stim, echo=F, fig.height=4.5, fig.width=9}
+m_rq1_disc_gen  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att.gen)
+m_rq1_epist_gen <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att.gen)
+m_rq1_disc_job  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att.job)
+m_rq1_epist_job <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att.job)
+
+triple_slope_compare(m_rq1_disc_gen,  m_rq1_disc_job,  "Disconnect",
+                     label1 = "General economy", label2 = "Jobs") +
+triple_slope_compare(m_rq1_epist_gen, m_rq1_epist_job, "Epistemic distrust",
+                     label1 = "General economy", label2 = "Jobs") +
+plot_annotation(title = "RQ1: Comment effect by pessimism × article — general economy vs. jobs stimulus")
+```
+
+---
+
+# Exploratory: Disconnect Sub-indices
+
+Decomposing the `disconnect` index into **people-centric populism** (`will_of_ppl`, `good_corrupt`, `leader_represent`) and **perceived elite unresponsiveness** (`system_stacked`, `public_officials_rev`, `econ_reality_rev`). Results help diagnose which sub-dimension drives the primary findings.
+
+## H1 by sub-index and item
+
+Coefficient plot of the `article_pos_tone × econ_pre_z` interaction for every item, both sub-indices, the full disconnect index, and all epistemic distrust items. Estimated in the neutral-comments arm with the preregistered control specification.
+
+```{r h1_subindex, echo=F, fig.height=7, fig.width=6}
+h1_outcomes <- list(
+  # Disconnect items
+  list(var = "will_of_ppl",          label = "Will of the people",         group = "Populism sub-index"),
+  list(var = "good_corrupt",         label = "Politicians corrupt",         group = "Populism sub-index"),
+  list(var = "leader_represent",     label = "Leaders represent people",    group = "Populism sub-index"),
+  list(var = "populism_sub",         label = "Populism sub-index",          group = "Populism sub-index"),
+  list(var = "system_stacked",       label = "System stacked against me",   group = "Elite unresponsiveness"),
+  list(var = "public_officials_rev", label = "Officials don't care (rev)",  group = "Elite unresponsiveness"),
+  list(var = "econ_reality_rev",     label = "Don't understand reality (rev)", group = "Elite unresponsiveness"),
+  list(var = "elite_resp",           label = "Elite unresponsiveness sub-index", group = "Elite unresponsiveness"),
+  list(var = "disconnect",           label = "Disconnect (full index)",     group = "Disconnect index"),
+  # Epistemic distrust items
+  list(var = "experts_claim",        label = "Experts claim too much",      group = "Epistemic distrust"),
+  list(var = "trust_experts_rev",    label = "Don't trust experts (rev)",   group = "Epistemic distrust"),
+  list(var = "news_trust_rev",       label = "Don't trust news (rev)",      group = "Epistemic distrust"),
+  list(var = "epistemic_distrust",   label = "Epistemic distrust (index)",  group = "Epistemic distrust")
+)
+
+h1_item_df <- map_dfr(h1_outcomes, function(o) {
+  m <- feols(as.formula(paste(o$var, "~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls]")),
+             data = df.neu)
+  term <- "article_pos_toneTRUE:econ_pre_z"
+  tibble(label = o$label, group = o$group,
+         estimate = coef(m)[term],
+         lo = confint(m)[term, 1], hi = confint(m)[term, 2],
+         is_index = grepl("index|sub-index", o$label))
+}) %>%
+  mutate(
+    label = factor(label, levels = rev(map_chr(h1_outcomes, "label"))),
+    group = factor(group, levels = c("Populism sub-index", "Elite unresponsiveness",
+                                     "Disconnect index", "Epistemic distrust"))
+  )
+
+ggplot(h1_item_df, aes(y = label, x = estimate, xmin = lo, xmax = hi,
+                        colour = group, shape = is_index, size = is_index)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(linewidth = 0.45) +
+  scale_shape_manual(values = c("TRUE" = 18, "FALSE" = 16), guide = "none") +
+  scale_size_manual( values = c("TRUE" = 0.6, "FALSE" = 0.35), guide = "none") +
+  scale_colour_manual(values = c(
+    "Populism sub-index"   = "#E41A1C",
+    "Elite unresponsiveness" = "#FF7F00",
+    "Disconnect index"     = "#333333",
+    "Epistemic distrust"   = "#4DAF4A")) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  labs(x = "article_pos_tone × econ_pre_z coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "H1: Article × pessimism interaction by item and sub-index",
+       subtitle = "Neutral-comments arm; diamonds = indices/sub-indices") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "none",
+        strip.text.y = element_text(size = 7, angle = 0),
+        panel.grid.major.y = element_blank())
+```
+
+## H2 by sub-index and item
+
+Coefficient plot showing article main effect, comment main effect, and their interaction for every item, both sub-indices, the full disconnect index, and all epistemic distrust items. Estimated in the full attention-passing sample with the preregistered control specification.
+
+```{r h2_subindex, echo=F, fig.height=7, fig.width=7}
+h2_outcomes <- list(
+  list(var = "will_of_ppl",          label = "Will of the people",              group = "Populism sub-index"),
+  list(var = "good_corrupt",         label = "Politicians corrupt",              group = "Populism sub-index"),
+  list(var = "leader_represent",     label = "Leaders represent people",         group = "Populism sub-index"),
+  list(var = "populism_sub",         label = "Populism sub-index",               group = "Populism sub-index"),
+  list(var = "system_stacked",       label = "System stacked against me",        group = "Elite unresponsiveness"),
+  list(var = "public_officials_rev", label = "Officials don't care (rev)",       group = "Elite unresponsiveness"),
+  list(var = "econ_reality_rev",     label = "Don't understand reality (rev)",   group = "Elite unresponsiveness"),
+  list(var = "elite_resp",           label = "Elite unresponsiveness sub-index", group = "Elite unresponsiveness"),
+  list(var = "disconnect",           label = "Disconnect (full index)",          group = "Disconnect index"),
+  list(var = "experts_claim",        label = "Experts claim too much",           group = "Epistemic distrust"),
+  list(var = "trust_experts_rev",    label = "Don't trust experts (rev)",        group = "Epistemic distrust"),
+  list(var = "news_trust_rev",       label = "Don't trust news (rev)",           group = "Epistemic distrust"),
+  list(var = "epistemic_distrust",   label = "Epistemic distrust (index)",       group = "Epistemic distrust")
+)
+
+trms_h2 <- c("comment_neg_toneTRUE", "article_pos_toneTRUE",
+             "comment_neg_toneTRUE:article_pos_toneTRUE")
+
+h2_item_df <- map_dfr(h2_outcomes, function(o) {
+  m  <- feols(as.formula(paste(o$var, "~ comment_neg_tone * article_pos_tone + .[controls]")),
+              data = df.att)
+  e  <- coef(m)[trms_h2]
+  ci <- confint(m)[trms_h2, , drop = FALSE]
+  tibble(term = trms_h2, estimate = e, lo = ci[, 1], hi = ci[, 2],
+         label = o$label, group = o$group,
+         is_index = grepl("index|sub-index", o$label))
+}) %>%
+  mutate(
+    treatment = recode(term,
+      "comment_neg_toneTRUE"                      = "Neg. comment",
+      "article_pos_toneTRUE"                      = "Pos. article",
+      "comment_neg_toneTRUE:article_pos_toneTRUE" = "Interaction"),
+    treatment = factor(treatment, levels = c("Neg. comment", "Pos. article", "Interaction")),
+    label = factor(label, levels = rev(map_chr(h2_outcomes, "label"))),
+    group = factor(group, levels = c("Populism sub-index", "Elite unresponsiveness",
+                                     "Disconnect index", "Epistemic distrust"))
+  )
+
+ggplot(h2_item_df, aes(y = label, x = estimate, xmin = lo, xmax = hi, colour = treatment)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.6), linewidth = 0.45, size = 0.35) +
+  scale_colour_manual(values = c(
+    "Neg. comment" = "#E41A1C",
+    "Pos. article" = "#2166AC",
+    "Interaction"  = "#5E4FA2")) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  labs(x = "Coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "H2: Article and comment effects by item and sub-index",
+       subtitle = "Full attention-passing sample") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "top",
+        strip.text.y = element_text(size = 7, angle = 0),
+        panel.grid.major.y = element_blank())
+```
+
+## RQ1 by sub-index
+
+```{r rq1_subindex, echo=F, fig.height=4, fig.width=9}
+m_rq1_pop   <- feols(populism_sub ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att)
+m_rq1_elite <- feols(elite_resp   ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.att)
+
+triple_slope_plot(m_rq1_pop,   "Populism sub-index") +
+triple_slope_plot(m_rq1_elite, "Elite unresponsiveness") +
+plot_annotation(title = "RQ1 by sub-index: comment effect by pessimism × article valence")
+```
+
+---
+
+# Exploratory: Education Moderation
+
+Comment × education and article × education interactions on disconnect and epistemic distrust.
+
+```{r edu, echo=F, fig.height=4, fig.width=10}
+slope_plot_mod <- function(model, var, mod_var, mod_label, title, ylab) {
+  int_term <- paste0(var, "TRUE:", mod_var)
+  b  <- coef(model)[int_term]
+  se <- sqrt(diag(vcov(model)))[int_term]
+  sub <- sprintf("b = %.3f (SE %.3f)", b, se)
+  slopes(model, variables = var,
+         newdata = do.call(datagrid,
+                           c(list(model = model),
+                             setNames(list(seq(-2, 2, by = 0.25)), mod_var)))) %>%
+    ggplot(aes(x = .data[[mod_var]], y = estimate, ymin = conf.low, ymax = conf.high)) +
+    geom_ribbon(alpha = 0.15) + geom_line() +
+    geom_hline(yintercept = 0, lty = 2, colour = "grey40") +
+    labs(title = title, subtitle = sub, x = mod_label, y = ylab) +
+    theme_bw(base_size = 9)
+}
+
+m_edu_com_disc  <- feols(disconnect         ~ comment_neg_tone * education_z + article_pos_tone + .[controls], data = df.att)
+m_edu_com_epist <- feols(epistemic_distrust ~ comment_neg_tone * education_z + article_pos_tone + .[controls], data = df.att)
+m_edu_art_disc  <- feols(disconnect         ~ article_pos_tone * education_z + comment_neg_tone + .[controls], data = df.att)
+m_edu_art_epist <- feols(epistemic_distrust ~ article_pos_tone * education_z + comment_neg_tone + .[controls], data = df.att)
+
+p_edu1 <- slope_plot_mod(m_edu_com_disc,  "comment_neg_tone", "education_z", "education (z)", "disconnect",         "AME of neg. comments")
+p_edu2 <- slope_plot_mod(m_edu_com_epist, "comment_neg_tone", "education_z", "education (z)", "epistemic_distrust", "AME of neg. comments")
+p_edu1 + p_edu2 + plot_annotation(title = "Comment channel: marginal effects by education")
+save_fig("edu.comment", height = 4, width = 10)
+
+p_edu3 <- slope_plot_mod(m_edu_art_disc,  "article_pos_tone", "education_z", "education (z)", "disconnect",         "AME of pos. article")
+p_edu4 <- slope_plot_mod(m_edu_art_epist, "article_pos_tone", "education_z", "education (z)", "epistemic_distrust", "AME of pos. article")
+p_edu3 + p_edu4 + plot_annotation(title = "Article channel: marginal effects by education")
+save_fig("edu.article", height = 4, width = 10)
+```
+
+---
+
+# Exploratory: Party ID Subgroup
+
+Comment and article main effects estimated separately within each party ID group. No directional prediction; reported descriptively.
+
+```{r pid, echo=F, fig.height=4, fig.width=8}
+df.dem <- df.att %>% filter(pid_democrat == 1)
+df.ind <- df.att %>% filter(pid_independent == 1)
+df.rep <- df.att %>% filter(pid_republican == 1)
+
+# Comment effects by PID
+m_pid_com_dem_disc  <- feols(disconnect         ~ comment_neg_tone + article_pos_tone + .[controls], data = df.dem)
+m_pid_com_ind_disc  <- feols(disconnect         ~ comment_neg_tone + article_pos_tone + .[controls], data = df.ind)
+m_pid_com_rep_disc  <- feols(disconnect         ~ comment_neg_tone + article_pos_tone + .[controls], data = df.rep)
+m_pid_com_dem_epist <- feols(epistemic_distrust ~ comment_neg_tone + article_pos_tone + .[controls], data = df.dem)
+m_pid_com_ind_epist <- feols(epistemic_distrust ~ comment_neg_tone + article_pos_tone + .[controls], data = df.ind)
+m_pid_com_rep_epist <- feols(epistemic_distrust ~ comment_neg_tone + article_pos_tone + .[controls], data = df.rep)
+
+# Article effects by PID
+m_pid_art_dem_disc  <- feols(disconnect         ~ article_pos_tone + comment_neg_tone + .[controls], data = df.dem)
+m_pid_art_ind_disc  <- feols(disconnect         ~ article_pos_tone + comment_neg_tone + .[controls], data = df.ind)
+m_pid_art_rep_disc  <- feols(disconnect         ~ article_pos_tone + comment_neg_tone + .[controls], data = df.rep)
+m_pid_art_dem_epist <- feols(epistemic_distrust ~ article_pos_tone + comment_neg_tone + .[controls], data = df.dem)
+m_pid_art_ind_epist <- feols(epistemic_distrust ~ article_pos_tone + comment_neg_tone + .[controls], data = df.ind)
+m_pid_art_rep_epist <- feols(epistemic_distrust ~ article_pos_tone + comment_neg_tone + .[controls], data = df.rep)
+
+extract_coef <- function(m, term, pid, channel, outcome) {
+  tibble(pid = pid, channel = channel, outcome = outcome,
+         estimate = coef(m)[term],
+         lo = confint(m)[term, 1], hi = confint(m)[term, 2])
+}
+
+pid_df <- bind_rows(
+  extract_coef(m_pid_com_dem_disc,  "comment_neg_toneTRUE", "Democrat",    "Neg. comment", "Disconnect"),
+  extract_coef(m_pid_com_ind_disc,  "comment_neg_toneTRUE", "Independent", "Neg. comment", "Disconnect"),
+  extract_coef(m_pid_com_rep_disc,  "comment_neg_toneTRUE", "Republican",  "Neg. comment", "Disconnect"),
+  extract_coef(m_pid_com_dem_epist, "comment_neg_toneTRUE", "Democrat",    "Neg. comment", "Epistemic distrust"),
+  extract_coef(m_pid_com_ind_epist, "comment_neg_toneTRUE", "Independent", "Neg. comment", "Epistemic distrust"),
+  extract_coef(m_pid_com_rep_epist, "comment_neg_toneTRUE", "Republican",  "Neg. comment", "Epistemic distrust"),
+  extract_coef(m_pid_art_dem_disc,  "article_pos_toneTRUE", "Democrat",    "Pos. article", "Disconnect"),
+  extract_coef(m_pid_art_ind_disc,  "article_pos_toneTRUE", "Independent", "Pos. article", "Disconnect"),
+  extract_coef(m_pid_art_rep_disc,  "article_pos_toneTRUE", "Republican",  "Pos. article", "Disconnect"),
+  extract_coef(m_pid_art_dem_epist, "article_pos_toneTRUE", "Democrat",    "Pos. article", "Epistemic distrust"),
+  extract_coef(m_pid_art_ind_epist, "article_pos_toneTRUE", "Independent", "Pos. article", "Epistemic distrust"),
+  extract_coef(m_pid_art_rep_epist, "article_pos_toneTRUE", "Republican",  "Pos. article", "Epistemic distrust"),
+) %>% mutate(pid = factor(pid, levels = c("Democrat", "Independent", "Republican")))
+
+ggplot(pid_df, aes(y = pid, x = estimate, xmin = lo, xmax = hi, colour = channel)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.5), linewidth = 0.5, size = 0.35) +
+  facet_grid(outcome ~ channel, scales = "free_x") +
+  scale_colour_manual(values = c("Neg. comment" = "#E41A1C", "Pos. article" = "#2166AC")) +
+  labs(x = "Coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "Exploratory: treatment effects by party ID") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "none", panel.grid.major.y = element_blank())
+save_fig("pid", height = 4, width = 8)
+```
+
+```{r pid_table, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_pid_com_dem_disc, m_pid_com_ind_disc, m_pid_com_rep_disc,
+  m_pid_com_dem_epist, m_pid_com_ind_epist, m_pid_com_rep_epist,
+  filename = "pid_comment.tex",
+  headers = c("Dem disc", "Ind disc", "Rep disc", "Dem epist", "Ind epist", "Rep epist"),
+  keep = c('comment_neg_tone')
+)
+
+save_etable(
+  m_pid_art_dem_disc, m_pid_art_ind_disc, m_pid_art_rep_disc,
+  m_pid_art_dem_epist, m_pid_art_ind_epist, m_pid_art_rep_epist,
+  filename = "pid_article.tex",
+  headers = c("Dem disc", "Ind disc", "Rep disc", "Dem epist", "Ind epist", "Rep epist"),
+  keep = c('article_pos_tone')
+)
+```
+
+---
+
+# Exploratory: Income Moderation
+
+Comment × income and article × income interactions. Income is a structural moderator of personal economic hardship; expected to produce activation-consistent signatures (lower income = larger response), similar to econ_pre but less partisan.
+
+```{r income, echo=F, fig.height=4, fig.width=10}
+# controls_noinc excludes faminc_num_log to avoid perfect collinearity with faminc_z
+controls_noinc <- ~ econ_identity + econ_pre + pop_pre2 + pop_pre3 + pop_pre4 + pop_pre5 + pop_pre6 +
+                    newsint + pid_democrat + pid_republican + education_yrs
+m_inc_com_disc  <- feols(disconnect         ~ comment_neg_tone * faminc_z + article_pos_tone + .[controls_noinc], data = df.att)
+m_inc_com_epist <- feols(epistemic_distrust ~ comment_neg_tone * faminc_z + article_pos_tone + .[controls_noinc], data = df.att)
+m_inc_art_disc  <- feols(disconnect         ~ article_pos_tone * faminc_z + comment_neg_tone + .[controls_noinc], data = df.att)
+m_inc_art_epist <- feols(epistemic_distrust ~ article_pos_tone * faminc_z + comment_neg_tone + .[controls_noinc], data = df.att)
+
+p_inc1 <- slope_plot_mod(m_inc_com_disc,  "comment_neg_tone", "faminc_z", "log income (z)", "disconnect",         "AME of neg. comments")
+p_inc2 <- slope_plot_mod(m_inc_com_epist, "comment_neg_tone", "faminc_z", "log income (z)", "epistemic_distrust", "AME of neg. comments")
+p_inc1 + p_inc2 + plot_annotation(title = "Comment channel: marginal effects by income")
+save_fig("income.comment", height = 4, width = 10)
+
+p_inc3 <- slope_plot_mod(m_inc_art_disc,  "article_pos_tone", "faminc_z", "log income (z)", "disconnect",         "AME of pos. article")
+p_inc4 <- slope_plot_mod(m_inc_art_epist, "article_pos_tone", "faminc_z", "log income (z)", "epistemic_distrust", "AME of pos. article")
+p_inc3 + p_inc4 + plot_annotation(title = "Article channel: marginal effects by income")
+save_fig("income.article", height = 4, width = 10)
+```
+
+```{r income_table, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_inc_com_disc, m_inc_com_epist, m_inc_art_disc, m_inc_art_epist,
+  filename = "income_mod.tex",
+  headers = c("com×disc", "com×epist", "art×disc", "art×epist"),
+  keep = c('faminc_z')
+)
+```
+
+---
+
+# Exploratory: IV/CACE by Pessimism Subgroup and Topic
+
+Instrument: `article_pos_tone`. Endogenous variable: average elite second-order belief (`so_elite_avg` = mean of `so_media`, `so_experts`, `so_pols`). Outcome: `disconnect` and `epistemic_distrust`. Controls: preregistered specification. Estimated separately for pessimists (`econ_pre` $\leq$ 2: Much/Somewhat worse, N=`r nrow(df.att %>% filter(econ_pre<=2))`) vs. others (`econ_pre` $\geq$ 3, N=`r nrow(df.att %>% filter(econ_pre>=3))`), and separately by article topic.
+
+```{r cace_subgroup, echo=F}
+df.att$so_elite_avg <- rowMeans(cbind(df.att$so_media, df.att$so_experts, df.att$so_pols), na.rm=TRUE)
+
+cace_tbl <- bind_rows(
+  map_dfr(list(
+    list(label="Pessimists (econ_pre<=2)", d=df.att %>% filter(econ_pre<=2)),
+    list(label="Others (econ_pre>=3)",    d=df.att %>% filter(econ_pre>=3)),
+    list(label="All",                     d=df.att),
+    list(label="General article",         d=df.att %>% filter(article_topic=="General")),
+    list(label="Jobs article",            d=df.att %>% filter(article_topic=="Jobs"))
+  ), function(g) {
+    fs <- feols(so_elite_avg ~ article_pos_tone + .[controls], data=g$d)
+    map_dfr(c("disconnect","epistemic_distrust"), function(y) {
+      iv <- feols(as.formula(paste(y,"~ .[controls] | so_elite_avg ~ article_pos_tone")), data=g$d)
+      tibble(Group=g$label, Outcome=y, N=nrow(g$d),
+             `FS b`=round(coef(fs)["article_pos_toneTRUE"],3),
+             `FS F`=round(fitstat(fs,"f")[[1]]$stat,1),
+             CACE=round(coef(iv)["fit_so_elite_avg"],3),
+             p=round(pvalue(iv)["fit_so_elite_avg"],3))
+    })
+  })
+) %>% mutate(CACE = sprintf("%.3f%s", CACE,
+               case_when(p<0.001~"***",p<0.01~"**",p<0.05~"*",TRUE~"")))
+
+kable(cace_tbl %>% select(-p), caption="IV/CACE estimates by pessimism subgroup and article topic")
+```
+
+*Key findings.* Among pessimists, SO updating produces large epistemic distrust effects (CACE $\approx$ +0.28) but near-zero disconnect effects --- H1b operates through the SO pathway specifically for pessimists. Among others, SO updating *reduces* disconnect (CACE $\approx$ -0.33), consistent with conventional media effects for those whose priors do not conflict with the positive signal. By topic, the general article produces a 2.5$\times$ larger CACE for epistemic distrust than the jobs article (0.24 vs. 0.10) despite a similar first stage --- the topic difference is not primarily explained by compliance rates but by the framing producing larger attitude effects per unit of SO updating, consistent with the welfare-claiming expert quote hypothesis.
+
+---
+
+# Robustness: econ_identity as Alternative Moderator
+
+`econ_identity` ("thinking of people like you, how are people like you doing financially?") is the **robustness moderator**; `econ_pre` remains the primary moderator throughout. All H1 and RQ1 analyses are replicated below with `econ_identity_z` substituted for `econ_pre_z`. If the two moderators diverge substantially (r < 0.4), both are reported and differences discussed.
+
+```{r econ_identity, echo=F, fig.height=4, fig.width=10}
+cat(sprintf("Correlation econ_pre vs econ_identity: r = %.3f\n",
+            cor(df.att$econ_pre, df.att$econ_identity, use = "complete.obs")))
+
+m_h1_disc_ei  <- feols(disconnect         ~ article_pos_tone * econ_identity_z + comment_neg_tone + .[controls], data = df.neu)
+m_h1_epist_ei <- feols(epistemic_distrust ~ article_pos_tone * econ_identity_z + comment_neg_tone + .[controls], data = df.neu)
+m_rq1_disc_ei  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_identity_z + .[controls], data = df.att)
+m_rq1_epist_ei <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_identity_z + .[controls], data = df.att)
+
+slope_plot_mod(m_h1_disc_ei,  "article_pos_tone", "econ_identity_z", "econ_identity (z)", "H1a (econ_identity)", "AME of pos. article") +
+slope_plot_mod(m_h1_epist_ei, "article_pos_tone", "econ_identity_z", "econ_identity (z)", "H1b (econ_identity)", "AME of pos. article") +
+plot_annotation(title = "H1 robustness: econ_identity as moderator")
+```
+
+---
+
+# Robustness: Unadjusted Estimates
+
+Preregistered estimates (with full control specification) compared against unadjusted estimates (treatment variables only). Solid lines / darker points = adjusted; dashed lines / lighter points = unadjusted.
+
+## H1 unadjusted
+
+```{r h1_unadj, echo=F, fig.height=3.5, fig.width=9}
+m_h1_disc_u  <- feols(disconnect         ~ article_pos_tone * econ_pre_z + comment_neg_tone, data = df.neu)
+m_h1_epist_u <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z + comment_neg_tone, data = df.neu)
+
+slope_compare(m_h1_disc,  m_h1_disc_u,  "article_pos_tone", "H1a: disconnect",         "AME of pos. article") +
+slope_compare(m_h1_epist, m_h1_epist_u, "article_pos_tone", "H1b: epistemic distrust", "AME of pos. article") +
+plot_annotation(title = "H1: Article backlash — adjusted vs. unadjusted")
+```
+
+## H2 unadjusted
+
+```{r h2_unadj, echo=F, fig.height=2.2, fig.width=5.5}
+m_h2_disc_u  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone, data = df.att)
+m_h2_epist_u <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone, data = df.att)
+
+int_term <- "comment_neg_toneTRUE:article_pos_toneTRUE"
+bind_rows(
+  tibble(outcome = "Epistemic distrust", spec = "Adjusted",
+         estimate = coef(m_h2_epist)[int_term],   lo = confint(m_h2_epist)[int_term,1],   hi = confint(m_h2_epist)[int_term,2]),
+  tibble(outcome = "Epistemic distrust", spec = "Unadjusted",
+         estimate = coef(m_h2_epist_u)[int_term], lo = confint(m_h2_epist_u)[int_term,1], hi = confint(m_h2_epist_u)[int_term,2]),
+  tibble(outcome = "Disconnect",         spec = "Adjusted",
+         estimate = coef(m_h2_disc)[int_term],    lo = confint(m_h2_disc)[int_term,1],    hi = confint(m_h2_disc)[int_term,2]),
+  tibble(outcome = "Disconnect",         spec = "Unadjusted",
+         estimate = coef(m_h2_disc_u)[int_term],  lo = confint(m_h2_disc_u)[int_term,1],  hi = confint(m_h2_disc_u)[int_term,2])
+) %>%
+  mutate(outcome = factor(outcome, levels = c("Disconnect", "Epistemic distrust")),
+         spec    = factor(spec,    levels = c("Adjusted", "Unadjusted"))) %>%
+  ggplot(aes(y = outcome, x = estimate, xmin = lo, xmax = hi, colour = spec)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.5), linewidth = 0.5, size = 0.45) +
+  scale_colour_manual(values = c("Adjusted" = "#333333", "Unadjusted" = "#999999")) +
+  labs(x = "Interaction coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "H2: Mismatch interaction — adjusted vs. unadjusted") +
+  theme_bw(base_size = 9) + theme(legend.position = "top", panel.grid.major.y = element_blank())
+```
+
+## RQ1 unadjusted
+
+```{r rq1_unadj, echo=F, fig.height=4.5, fig.width=9}
+m_rq1_disc_u  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_pre_z, data = df.att)
+m_rq1_epist_u <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_pre_z, data = df.att)
+
+triple_slope_compare(m_rq1_disc,  m_rq1_disc_u,  "Disconnect") +
+triple_slope_compare(m_rq1_epist, m_rq1_epist_u, "Epistemic distrust") +
+plot_annotation(title = "RQ1: Comment effect by pessimism × article — adjusted vs. unadjusted")
+```
+
+---
+
+# Robustness: No Exclusions
+
+Preregistered estimates (attention-passing sample, N=`r nrow(df.att)`) compared against full sample including attention check failures and speeders (N=`r nrow(df.full)`). Same control specification throughout.
+
+## H1 no exclusions
+
+```{r h1_noexcl, echo=F, fig.height=3.5, fig.width=9}
+m_h1_disc_f  <- feols(disconnect         ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.full.neu)
+m_h1_epist_f <- feols(epistemic_distrust ~ article_pos_tone * econ_pre_z + comment_neg_tone + .[controls], data = df.full.neu)
+
+slope_compare(m_h1_disc,  m_h1_disc_f,  "article_pos_tone", "H1a: disconnect",         "AME of pos. article",
+              label1 = "Passing sample", label2 = "No exclusions") +
+slope_compare(m_h1_epist, m_h1_epist_f, "article_pos_tone", "H1b: epistemic distrust", "AME of pos. article",
+              label1 = "Passing sample", label2 = "No exclusions") +
+plot_annotation(title = "H1: Article backlash — passing sample vs. no exclusions")
+```
+
+## H2 no exclusions
+
+```{r h2_noexcl, echo=F, fig.height=2.2, fig.width=5.5}
+m_h2_disc_f  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone + .[controls], data = df.full)
+m_h2_epist_f <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone + .[controls], data = df.full)
+
+int_term <- "comment_neg_toneTRUE:article_pos_toneTRUE"
+bind_rows(
+  tibble(outcome = "Epistemic distrust", spec = "Passing sample",
+         estimate = coef(m_h2_epist)[int_term],   lo = confint(m_h2_epist)[int_term,1],   hi = confint(m_h2_epist)[int_term,2]),
+  tibble(outcome = "Epistemic distrust", spec = "No exclusions",
+         estimate = coef(m_h2_epist_f)[int_term], lo = confint(m_h2_epist_f)[int_term,1], hi = confint(m_h2_epist_f)[int_term,2]),
+  tibble(outcome = "Disconnect",         spec = "Passing sample",
+         estimate = coef(m_h2_disc)[int_term],    lo = confint(m_h2_disc)[int_term,1],    hi = confint(m_h2_disc)[int_term,2]),
+  tibble(outcome = "Disconnect",         spec = "No exclusions",
+         estimate = coef(m_h2_disc_f)[int_term],  lo = confint(m_h2_disc_f)[int_term,1],  hi = confint(m_h2_disc_f)[int_term,2])
+) %>%
+  mutate(outcome = factor(outcome, levels = c("Disconnect", "Epistemic distrust")),
+         spec    = factor(spec,    levels = c("Passing sample", "No exclusions"))) %>%
+  ggplot(aes(y = outcome, x = estimate, xmin = lo, xmax = hi, colour = spec)) +
+  geom_vline(xintercept = 0, lty = 2, colour = "grey55", linewidth = 0.35) +
+  geom_pointrange(position = position_dodge(0.5), linewidth = 0.5, size = 0.45) +
+  scale_colour_manual(values = c("Passing sample" = "#333333", "No exclusions" = "#999999")) +
+  labs(x = "Interaction coefficient (95% CI)", y = NULL, colour = NULL,
+       title = "H2: Mismatch interaction — passing sample vs. no exclusions") +
+  theme_bw(base_size = 9) + theme(legend.position = "top", panel.grid.major.y = element_blank())
+```
+
+## RQ1 no exclusions
+
+```{r rq1_noexcl, echo=F, fig.height=4.5, fig.width=9}
+m_rq1_disc_f  <- feols(disconnect         ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.full)
+m_rq1_epist_f <- feols(epistemic_distrust ~ comment_neg_tone * article_pos_tone * econ_pre_z + .[controls], data = df.full)
+
+triple_slope_compare(m_rq1_disc,  m_rq1_disc_f,  "Disconnect",         label1 = "Passing sample", label2 = "No exclusions") +
+triple_slope_compare(m_rq1_epist, m_rq1_epist_f, "Epistemic distrust", label1 = "Passing sample", label2 = "No exclusions") +
+plot_annotation(title = "RQ1: Comment effect by pessimism × article — passing sample vs. no exclusions")
+```
+
+---
+
+# Appendix: Balance and Attrition
+
+## Covariate Balance
+
+Regress each pre-treatment covariate on `article_pos_tone`, `comment_neg_tone`, and their interaction. All p-values should be large under successful randomization. Estimated on the full attention-passing sample.
+
+```{r balance, echo=F}
+balance_vars <- list(
+  list(var = "econ_pre",       label = "Econ. perceptions (pre)"),
+  list(var = "econ_identity",  label = "Econ. identity"),
+  list(var = "pop_pre2",       label = "Pop. pre: will of people"),
+  list(var = "pop_pre3",       label = "Pop. pre: system stacked"),
+  list(var = "pop_pre4",       label = "Pop. pre: public officials (rev)"),
+  list(var = "pop_pre5",       label = "Pop. pre: news media (rev)"),
+  list(var = "pop_pre6",       label = "Pop. pre: trust experts (rev)"),
+  list(var = "pid_democrat",   label = "Party ID: Democrat"),
+  list(var = "pid_republican", label = "Party ID: Republican"),
+  list(var = "newsint",        label = "News interest"),
+  list(var = "education_yrs",  label = "Education (years)"),
+  list(var = "faminc_num_log", label = "Log household income")
+)
+
+balance_df <- map_dfr(balance_vars, function(v) {
+  m  <- feols(as.formula(paste(v$var, "~ article_pos_tone * comment_neg_tone")), data = df.att)
+  ct <- coeftable(m)
+  tibble(
+    Covariate   = v$label,
+    `b (article)`     = round(ct["article_pos_toneTRUE", "Estimate"], 3),
+    `p (article)`     = fmt_pv(ct["article_pos_toneTRUE", "Pr(>|t|)"]),
+    `b (comment)`     = round(ct["comment_neg_toneTRUE", "Estimate"], 3),
+    `p (comment)`     = fmt_pv(ct["comment_neg_toneTRUE", "Pr(>|t|)"]),
+    `b (interaction)` = round(ct["article_pos_toneTRUE:comment_neg_toneTRUE", "Estimate"], 3),
+    `p (interaction)` = fmt_pv(ct["article_pos_toneTRUE:comment_neg_toneTRUE", "Pr(>|t|)"])
+  )
+})
+
+kable(balance_df, align = "lrrrrrr",
+      caption = sprintf("Covariate balance (N = %d). OLS of each covariate on treatment indicators; no controls.", nrow(df.att)))
+```
+
+## Differential Attrition
+
+**Note on non-completions:** All `r nrow(df %>% filter(!is.na(Q_manip_tone_1), group %in% as.character(1:4)))` respondents in the Qualtrics export have `Finished = TRUE` and `Progress = 100`. True survey drop-off (participants who accepted on Prolific but never submitted) is not recorded in the Qualtrics data; that count would require the Prolific study dashboard. The analysis below therefore captures *exclusion-criteria attrition* only: respondents who completed the survey but were excluded for failing the attention check, speeding, or triggering the bot-detection item.
+
+```{r diff_attrition, echo=F}
+df_excl <- df %>%
+  filter(!is.na(Q_manip_tone_1), group %in% as.character(1:4)) %>%
+  mutate(excluded = as.integer(att != "N/A"))
+
+# Breakdown by exclusion type and arm
+excl_tab <- df_excl %>%
+  mutate(article = if_else(article_pos_tone, "Pos. article", "Neg. article"),
+         comment = if_else(comment_neg_tone, "Neg. comment", "Neu. comment")) %>%
+  group_by(article, comment) %>%
+  summarise(n = n(), excluded = sum(excluded), rate = sprintf("%.1f%%", 100*mean(excluded)),
+            .groups = "drop")
+kable(excl_tab, col.names = c("Article", "Comment", "N", "Excluded", "Rate"),
+      caption = "Exclusions by treatment arm.")
+
+m_attr    <- feols(excluded ~ article_pos_tone * comment_neg_tone, data = df_excl)
+ct_attr   <- coeftable(m_attr)
+tibble(
+  Term = c("(Intercept)", "Article positive", "Comment negative", "Interaction"),
+  b    = round(ct_attr[, "Estimate"], 4),
+  SE   = round(ct_attr[, "Std. Error"], 4),
+  p    = fmt_pv(ct_attr[, "Pr(>|t|)"]),
+  ` `  = sapply(ct_attr[, "Pr(>|t|)"], stars)
+) %>% kable(align = "lrrrr",
+            caption = sprintf("OLS of exclusion indicator on treatment (N = %d, overall exclusion rate = %.1f%%). Robust SEs.", nrow(df_excl), 100*mean(df_excl$excluded)))
+```
+
+Any differential exclusion rates across arms could induce selection bias if the types of respondents excluded differ systematically. The robustness check in the **"No Exclusions"** section above replicates all primary analyses on the full sample (including excluded respondents); results for H1a, H1b, and H2a are stable. H2b (epistemic distrust mismatch) loses significance in the full sample but retains similar magnitude, suggesting the interaction estimate is somewhat sensitive to the composition of the analysis sample.
+
+---
+
+# Appendix: Regression Tables
+
+*Tables in this appendix are saved to `experiment/tables/` as `.tex` files for inclusion in writeups.*
+
+## H1: Article Backlash — Neutral-Comments Arm
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(m_h1_disc, m_h1_epist,
+  filename = "h1_backlash.tex",
+  headers = c("H1a: disconnect", "H1b: epist.\\ distrust"))
+```
+
+## H2: Mismatch Interaction — Full Sample
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(m_h2_disc, m_h2_epist,
+  filename = "h2_mismatch.tex",
+  headers = c("H2a: disconnect", "H2b: epist.\\ distrust"),
+  keep = c('tone'))
+```
+
+## RQ1: Comment × econ_pre — Positive Article Arm
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(m_rq1_disc, m_rq1_epist,
+  filename = "rq1_het.tex",
+  headers = c("disconnect", "epist.\\ distrust"),
+  keep = c('econ_pre_z'))
+```
+
+## Education Moderation
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(m_edu_com_disc, m_edu_com_epist, m_edu_art_disc, m_edu_art_epist,
+  filename = "education_mod.tex",
+  headers = c("com×disc", "com×epist", "art×disc", "art×epist"),
+  keep = c('education_z'))
+```
+
+## Party ID — Comment Effects
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_pid_com_dem_disc, m_pid_com_ind_disc, m_pid_com_rep_disc,
+  m_pid_com_dem_epist, m_pid_com_ind_epist, m_pid_com_rep_epist,
+  filename = "pid_comment.tex",
+  headers = c("Dem disc", "Ind disc", "Rep disc", "Dem epist", "Ind epist", "Rep epist"),
+  keep = c('comment_neg_tone'))
+```
+
+## Party ID — Article Effects
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(
+  m_pid_art_dem_disc, m_pid_art_ind_disc, m_pid_art_rep_disc,
+  m_pid_art_dem_epist, m_pid_art_ind_epist, m_pid_art_rep_epist,
+  filename = "pid_article.tex",
+  headers = c("Dem disc", "Ind disc", "Rep disc", "Dem epist", "Ind epist", "Rep epist"),
+  keep = c('article_pos_tone'))
+```
+
+## Income Moderation
+
+```{r, results='asis', echo=F, eval=FALSE}
+save_etable(m_inc_com_disc, m_inc_com_epist, m_inc_art_disc, m_inc_art_epist,
+  filename = "income_mod.tex",
+  headers = c("com×disc", "com×epist", "art×disc", "art×epist"),
+  keep = c('faminc_z'))
+```
+

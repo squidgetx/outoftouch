@@ -7,11 +7,72 @@ pacman::p_load(tidyverse, fixest, furrr, here)
 
 alpha <- 0.05 # Standard significance level
 sims <- 400 # Number of simulations to conduct for each N
+plan(multisession, workers = 4)
+c_vals <- c(0.70, 0.78)
+```
+
+
+```{r}
+test_sim_h1 <- function(N, c, tau_het = 0.2) {
+  eff_N = N/2
+  # Scale because H1 is estimated on half the data
+  X <- MASS::mvrnorm(n = eff_N, mu = c(0, 0), Sigma = matrix(c(1, c, c, 1), 2))
+
+  # econ_pre: continuous moderator (standardized, ~N(0,1))
+  econ_pre <- rnorm(eff_N)
+
+  Y0 <- X[, 2]
+  Y0 <- Y0 / sd(Y0)
+
+  results <- map_dfr(1:sims, \(i) {
+    ap <- rbinom(eff_N, 1, 0.5)  # article_positive
+
+    # DGP: Y = Y0 + tau_het * (ap * econ_pre) + noise
+    # For optimists (high econ_pre), article effect is smaller
+    # For pessimists (low econ_pre), article effect is larger
+    err <- rnorm(eff_N, 0, 1)
+    Y <- Y0 + tau_het * ap * econ_pre + err
+
+    d <- data.frame(Y = Y, Y0=Y0,X = X[, 1], ap = ap, econ_pre = econ_pre)
+
+    fit <- lm(Y ~ ap *  econ_pre + X, data = d)
+    cs <- coef(summary(fit))
+
+    list(
+      'h1.sig' = cs["ap:econ_pre", "Pr(>|t|)"] <= alpha,
+      'h1.est' = cs["ap:econ_pre", "Estimate"],
+      'r2' = (feols(Y0 ~ X, data = d) %>% fitstat(type='r2'))$r2
+    )
+  })
+  list(
+    h1.power = mean(results$h1.sig),
+    h1.est = mean(results$h1.sig),
+    N = N,
+    tau_het = tau_het,
+    r2 = mean(results$r2),
+    c_val = c
+  )
+}
+
+df_h1 <- future_map_dfr(seq(500, 2500, 100), \(Na) {
+  map_dfr(c_vals, \(cv) {
+    map_dfr(c(0.20, 0.3, 0.15), \(th) {
+      test_sim_h1(N = Na, c = cv, tau_het = th)
+    })
+  })
+}, .options = furrr_options(seed = 457)) %>%
+  mutate(
+    name = "Article Backlash (H1)",
+    value = h1.power,
+    r2 = factor(round(r2, 1)),
+    effect_size = factor(tau_het),
+  ) %>%
+  select(N, name, value, r2, effect_size, c_val)
+```
+
+```{r}
 tau2 <- 0
-c <- 0.7
-
-
-test_sim <- function(N, c, tau=0.2) { 
+test_sim <- function(N, c, tau=0.2) {
   X <- MASS::mvrnorm(n=N, mu=c(0, 0), Sigma=matrix(c(1, c, c, 1), 2))
   err <- rnorm(n = N, mean = 0, sd = 1)
   Y0 <- X[, 2]
@@ -23,7 +84,7 @@ test_sim <- function(N, c, tau=0.2) {
   # Y3 is negative article, negative comments
   Y3 <- Y0 + tau2
   # Y4 is negative article, neutral comments
-  Y4 <- Y0 
+  Y4 <- Y0
   results <- map_dfr(1:sims, \(i) {
     negative.comments <- rbinom(N, 1, 0.5)
     negative.article <- rbinom(N, 1, 0.5)
@@ -37,7 +98,7 @@ test_sim <- function(N, c, tau=0.2) {
         nc == 0 & na==1 ~ Y4,
       )
     )
-    fit.sim <- lm(Y ~ nc * na + X, data = d) 
+    fit.sim <- lm(Y ~ nc * na + X, data = d)
     list(
       'h1.sig' = coef(summary(fit.sim))["nc", "Pr(>|t|)"] <= alpha,
       'h2.sig' = coef(summary(fit.sim))["nc:na", "Pr(>|t|)"] <= alpha,
@@ -58,34 +119,21 @@ test_sim <- function(N, c, tau=0.2) {
   )
 }
 
-plan(multisession, workers = 4)
-df <- future_map_dfr(seq(400,2200,100), \(Na) {
-  map_dfr(
-    c(0.6, 0.7, 0.8), \(ca) {
-      test_sim(N=Na, c=ca)
-    }
-  )
-}, .options = furrr_options(seed = 123))
-df <- future_map_dfr(c(0.2,0.3,0.4, 0.5), \(Na) {
-    test_sim(N=300, c=0.45, tau=Na)
-}, .options = furrr_options(seed = 123))
-df$r2.emp %>% mean
-df %>% ggplot(aes(x=tau, y=h1.power)) + geom_point()
-
-
-df_main <- df %>%
-  group_by(c.raw) %>%
-  mutate(r2 = factor(round(mean(r2.emp), digits=1))) %>%
-  ungroup() %>%
-  pivot_longer(c(h1.power, h2.power)) %>%
+df_mismatch <- future_map_dfr(seq(500,2500,100), \(Na) {
+  map_dfr(c_vals, \(cv) {
+    map_dfr(c(0.2, 0.3, 0.15), \(ca) {
+      test_sim(N=Na, tau=ca, c=cv)
+    })
+  })
+}, .options = furrr_options(seed = 123)) %>%
   mutate(
-    name = recode(name,
-      "h1.power" = "Comment Main Effect",
-      "h2.power" = "Mismatch Interaction"
-    ),
-    effect_size = factor(tau)
+    r2 = factor(round(mean(r2.emp), digits=1)),
+    name = "Mismatch Interaction (H2)",
+    value = h2.power,
+    effect_size = factor(tau),
+    c_val = c.raw
   ) %>%
-  select(N, name, value, r2, effect_size)
+  select(N, name, value, r2, effect_size, c_val)
 ```
 
 ## Power for Triple Interaction (H4): Mismatch × Econ_Pre
@@ -131,46 +179,40 @@ test_sim_het <- function(N, c, tau_het = 0.2, tau_main = 0.2) {
     )
   })
   list(
-    mismatch.power = mean(results$mismatch.sig),
     triple.power = mean(results$triple.sig),
-    mismatch.est = mean(results$mismatch.est),
     triple.est = mean(results$triple.est),
     N = N,
     tau_het = tau_het,
-    r2 = mean(results$r2)
+    r2 = mean(results$r2),
+    c_val = c
   )
 }
 
-plan(multisession, workers = 4)
 df_het <- future_map_dfr(seq(500, 2500, 100), \(Na) {
-  map_dfr(
-    c(0.20, 0.3, 0.4), \(th) {
-      test_sim_het(N = Na, c = 0.7, tau_het = th, tau_main = 0.2)
-    }
-  )
+  map_dfr(c_vals, \(cv) {
+    map_dfr(c(0.20, 0.3, 0.4), \(th) {
+      test_sim_het(N = Na, c = cv, tau_het = th, tau_main = 0)
+    })
+  })
 }, .options = furrr_options(seed = 457))
 
 df_triple <- df_het %>%
   mutate(
-    name = "Triple Interaction",
+    name = "Triple Interaction (RQ1)",
     value = triple.power,
     r2 = factor(round(r2, 1)),
-    effect_size = factor(tau_het)
+    effect_size = factor(tau_het),
   ) %>%
-  select(N, name, value, r2, effect_size)
+  select(N, name, value, r2, effect_size, c_val)
 
-bind_rows(df_main, df_triple) %>%
-  mutate(name = factor(name, levels = c(
-    "Comment Main Effect",
-    "Mismatch Interaction",
-    "Triple Interaction"
-  ))) %>%
-  ggplot(aes(x = N, y = value, color = effect_size, lty = r2)) +
-  geom_point(size = 0.8) +
+bind_rows(df_h1, df_mismatch, df_triple) %>%
+  mutate(R2 = round(as.numeric(c_val) * as.numeric(c_val), 1)) %>% 
+  ggplot(aes(x = N, y = value, color = effect_size, lty = factor(R2))) +
   geom_smooth(se = FALSE) +
   facet_wrap(~name) +
   geom_hline(yintercept = 0.8, lty = 3, alpha = 0.5) +
-  labs(y = "Power", color = "Effect size", lty = expression(R^2)) +
+  geom_hline(yintercept = 0.8, lty = 3, alpha = 0.5) +
+  labs(y = "Power", color = "Effect size", lty = "R2") +
   theme_bw()
-ggsave(here('figures/power3.png'), width = 12, height = 4)
+ggsave(here('figures/power.png'), width = 12, height = 4)
 ```
